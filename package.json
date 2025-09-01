@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-streetfighter6-rank",
-  "description": "rank",
-  "version": "0.0.1",
+  "description": "一个用于查询《街头霸王6》玩家数据的 Koishi 插件，支持排位查询、胜率分析、战斗记录截图和玩家搜索功能",
+  "version": "0.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,11 +9,29 @@
     "dist"
   ],
   "license": "MIT",
+  "author": {
+    "name": "WhiteBr1ck",
+    "url": "https://github.com/WhiteBr1ck"
+  },
+  "homepage": "https://github.com/WhiteBr1ck/koishi-plugin-streetfighter6-rank#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WhiteBr1ck/koishi-plugin-streetfighter6-rank.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WhiteBr1ck/koishi-plugin-streetfighter6-rank/issues"
+  },
   "scripts": {},
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "streetfighter6",
+    "sf6",
+    "street-fighter",
+    "gaming",
+    "rank",
+    "buckler"
   ],
   "devDependencies": {},
   "peerDependencies": {
