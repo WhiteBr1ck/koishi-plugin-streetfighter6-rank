@@ -45,6 +45,7 @@ export interface Config {
   // 功能开关
   enableTextOutput: boolean
   enableScreenshotOutput: boolean
+  enableForwardMessage: boolean
   
   // 调试选项
   debug: boolean
@@ -69,6 +70,7 @@ export const Config: Schema<Config> = Schema.intersect([
     // 功能开关
     enableTextOutput: Schema.boolean().default(true).description('启用文本信息输出'),
     enableScreenshotOutput: Schema.boolean().default(true).description('启用截图输出'),
+    enableForwardMessage: Schema.boolean().default(false).description('启用合并转发消息（玩家搜索结果）'),
   }).description('功能开关'),
   
   Schema.object({
@@ -1565,24 +1567,38 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         
         if (results.text && results.text.length > 0) {
           try {
-            const header = `🔍 搜索到 ${results.text.length} 个玩家：`
-            const lines = results.text.map((player, index) => {
-              return `${index + 1}. ${player.playerName}\n   ID: ${player.playerId}\n   链接: ${player.url}`
-            })
-            const fullText = [header, '', ...lines].join('\n')
+            if (config.enableForwardMessage && results.text.length > 1 && ['qq', 'onebot'].includes(session?.platform)) {
+              // 使用合并转发发送多个玩家结果
+              const contentNodes = [
+                h.text(`🔍 搜索到 ${results.text.length} 个玩家：`),
+                ...results.text.map((player, index) => 
+                  h.text(`${index + 1}. ${player.playerName}\nID: ${player.playerId}\n链接: ${player.url}`)
+                )
+              ]
+              
+              await session?.send(h('figure', {}, contentNodes))
+              responses.push('合并转发消息')
+            } else {
+              // 普通消息发送
+              const header = `🔍 搜索到 ${results.text.length} 个玩家：`
+              const lines = results.text.map((player, index) => {
+                return `${index + 1}. ${player.playerName}\n   ID: ${player.playerId}\n   链接: ${player.url}`
+              })
+              const fullText = [header, '', ...lines].join('\n')
 
-            // 分段发送，避免过长被平台截断
-            const chunks: string[] = []
-            const maxLen = 3500
-            let start = 0
-            while (start < fullText.length) {
-              chunks.push(fullText.slice(start, start + maxLen))
-              start += maxLen
+              // 分段发送，避免过长被平台截断
+              const chunks: string[] = []
+              const maxLen = 3500
+              let start = 0
+              while (start < fullText.length) {
+                chunks.push(fullText.slice(start, start + maxLen))
+                start += maxLen
+              }
+              for (const chunk of chunks) {
+                await session?.send(chunk)
+              }
+              responses.push('文本信息')
             }
-            for (const chunk of chunks) {
-              await session?.send(chunk)
-            }
-            responses.push('文本信息')
           } catch (e) {
             warnLog('文本发送失败:', e)
             responses.push('文本发送失败')

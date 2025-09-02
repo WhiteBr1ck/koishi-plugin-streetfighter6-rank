@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-streetfighter6-rank",
   "description": "一个用于查询《街头霸王6》玩家数据的 Koishi 插件，支持排位查询、胜率分析、战斗记录截图、玩家搜索和绑定ID功能",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
