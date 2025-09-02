@@ -3,7 +3,7 @@ import { readFileSync } from 'fs'
 import { resolve } from 'path'
 
 export const name = 'streetfighter6-rank'
-export const inject = ['puppeteer']
+export const inject = ['puppeteer', 'database']
 
 declare module 'koishi' {
   interface Context {
@@ -24,6 +24,15 @@ declare module 'koishi' {
       }>
     }
   }
+  interface Tables {
+    streetfighter6_binding: StreetFighter6Binding
+  }
+}
+
+export interface StreetFighter6Binding {
+  id: number
+  userId: string
+  playerId: string
 }
 
 export interface Config {
@@ -53,7 +62,7 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('ko-kr').description('한국어'),
     ]).default('zh-hans').description('页面语言'),
     userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36').description('浏览器标识'),
-    cookie: Schema.string().role('secret').description('登录 Cookie（从浏览器复制，或通过环境变量 SF6_COOKIE 提供）'),
+    cookie: Schema.string().role('secret').description('登录 Cookie'),
   }).description('网站连接配置'),
   
   Schema.object({
@@ -124,6 +133,16 @@ function redactCookie(c?: string) {
 
 export function apply(ctx: Context, config: Config) {
   const log = logger
+
+  // 创建专门的数据表来存储 SF6 玩家ID绑定
+  ctx.model.extend('streetfighter6_binding', {
+    id: 'unsigned',
+    userId: 'string',
+    playerId: 'string',
+  }, {
+    primary: 'id',
+    autoInc: true,
+  })
 
   // 内部常量
   const CACHE_TTL = 600 // 缓存时间 600 秒
@@ -217,123 +236,126 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
   const results: PlayerSearchResult[] = []
   
   debugLog('开始解析搜索结果页面...')
+  debugLog(`HTML长度: ${html.length}`)
   
   // 方法1: 匹配 list_fighter_list 容器内的每个 li 元素
-  const fighterListRegex = /<ul class="list_fighter_list__[^"]*"[^>]*>([\s\S]*?)<\/ul>/g
-  let listMatch = fighterListRegex.exec(html)
+  const fighterListRegex = /<ul class="list_fighter_list__[^"]*"[^>]*>([\s\S]*?)<\/ul>/
+  const listMatch = fighterListRegex.exec(html)
   
   if (listMatch) {
     debugLog('找到 list_fighter_list 容器')
     const listContent = listMatch[1]
+    debugLog(`list内容长度: ${listContent.length}`)
     
-    // 匹配每个 li 项目
-    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/g
-    let liMatch
+    // 匹配每个 li 项目 - 使用全局匹配
+    const liRegex = /<li[^>]*>[\s\S]*?<\/li>/g
+    const liMatches = listContent.match(liRegex) || []
+    debugLog(`找到 ${liMatches.length} 个 li 元素`)
     
-    while ((liMatch = liRegex.exec(listContent)) !== null) {
-      const liContent = liMatch[1]
-      debugLog(`处理 li 元素，长度: ${liContent.length}`)
+    for (let i = 0; i < liMatches.length; i++) {
+      const liContent = liMatches[i]
+      debugLog(`处理第 ${i + 1} 个 li 元素`)
       
-      // 提取 href 和玩家ID
-      const hrefMatch = liContent.match(/href="([^"]*\/profile\/(\d+))"/)
-      if (!hrefMatch) {
-        debugLog('未找到 profile 链接')
+      // 跳过非玩家项目的li（比如表头、分隔符等）
+      if (liContent.includes('list_lp__') || liContent.includes('---积分') || liContent.includes('class="list_lp')) {
+        debugLog(`第 ${i + 1} 个li是非玩家项目，跳过`)
         continue
       }
       
-      const fullPath = hrefMatch[1]
+      // 提取相对路径的profile URL和玩家ID
+      const hrefMatch = liContent.match(/href="(\/6\/buckler\/[^\/]+\/profile\/(\d+))"/)
+      if (!hrefMatch) {
+        debugLog(`第 ${i + 1} 个li未找到 profile 链接`)
+        debugLog(`li内容片段: ${liContent.substring(0, 300)}`)
+        continue
+      }
+      
+      const relativePath = hrefMatch[1]
       const playerId = hrefMatch[2]
-      debugLog(`找到玩家ID: ${playerId}`)
+      // 修正URL拼接 - config.baseUrl已经包含了主域名，所以直接拼接相对路径
+      const fullUrl = `https://www.streetfighter.com${relativePath}`
+      debugLog(`第 ${i + 1} 个li找到玩家ID: ${playerId}`)
+      debugLog(`第 ${i + 1} 个li相对路径: ${relativePath}`)
+      debugLog(`第 ${i + 1} 个li完整URL: ${fullUrl}`)
       
       // 提取玩家名称
       const nameMatch = liContent.match(/<span class="list_name__[^"]*">([^<]+)<\/span>/)
       if (!nameMatch) {
-        debugLog('未找到玩家名称')
+        debugLog(`第 ${i + 1} 个li未找到玩家名称`)
         continue
       }
       
       const playerName = nameMatch[1].trim()
-      debugLog(`找到玩家名称: ${playerName}`)
+      debugLog(`第 ${i + 1} 个li找到玩家名称: ${playerName}`)
       
       if (playerId && playerName) {
         results.push({
           playerId,
           playerName,
-          url: `${config.baseUrl}${fullPath}`
+          url: fullUrl  // 直接使用完整URL
         })
-        debugLog(`成功解析玩家: ${playerName} (ID: ${playerId})`)
+        debugLog(`第 ${i + 1} 个li成功解析: ${playerName} (ID: ${playerId})`)
       }
     }
   } else {
     debugLog('未找到 list_fighter_list 容器')
   }
   
-  // 方法2: 如果方法1失败，尝试直接匹配 profile 链接和玩家名称
-  if (results.length === 0) {
-    debugLog('方法1失败，尝试直接匹配...')
-    
-    // 先找到所有的 profile 链接
-    const profileRegex = /href="([^"]*\/profile\/(\d+))"/g
-    const profileMatches = []
+  // 方法2: 直接匹配整个HTML中的 profile 链接和玩家名称（更可靠）
+  debugLog('使用方法2：直接匹配整个HTML...')
+  
+  // 先找到所有的相对路径 profile 链接 - 扩展正则以捕获更多可能的链接格式
+  const profileRegexes = [
+    /href="(\/6\/buckler\/[^\/]+\/profile\/(\d+))"/g,  // 标准格式
+    /href="([^"]*\/profile\/(\d+)[^"]*)"/g,           // 更宽松的格式
+  ]
+  
+  const profileMatches = []
+  
+  for (const profileRegex of profileRegexes) {
+    profileRegex.lastIndex = 0 // 重置正则状态
     let profileMatch
-    
     while ((profileMatch = profileRegex.exec(html)) !== null) {
-      profileMatches.push({
-        fullPath: profileMatch[1],
-        playerId: profileMatch[2]
-      })
-    }
-    
-    debugLog(`找到 ${profileMatches.length} 个 profile 链接`)
-    
-    // 然后找到所有的玩家名称
-    const nameRegex = /<span class="list_name__[^"]*">([^<]+)<\/span>/g
-    const nameMatches = []
-    let nameMatch
-    
-    while ((nameMatch = nameRegex.exec(html)) !== null) {
-      nameMatches.push(nameMatch[1].trim())
-    }
-    
-    debugLog(`找到 ${nameMatches.length} 个玩家名称: ${nameMatches.join(', ')}`)
-    
-    // 假设链接和名称的顺序是对应的
-    const minLength = Math.min(profileMatches.length, nameMatches.length)
-    for (let i = 0; i < minLength; i++) {
-      const profile = profileMatches[i]
-      const playerName = nameMatches[i]
+      const fullPath = profileMatch[1]
+      const playerId = profileMatch[2]
       
-      results.push({
-        playerId: profile.playerId,
-        playerName: playerName,
-        url: `${config.baseUrl}${profile.fullPath}`
-      })
-      debugLog(`配对成功: ${playerName} (ID: ${profile.playerId})`)
+      // 避免重复添加相同的玩家ID
+      if (!profileMatches.find(p => p.playerId === playerId)) {
+        const fullUrl = fullPath.startsWith('http') ? fullPath : `https://www.streetfighter.com${fullPath}`
+        profileMatches.push({
+          relativePath: fullPath,
+          playerId: playerId,
+          fullUrl: fullUrl
+        })
+      }
     }
   }
   
-  // 方法3: 最后的备用方案，使用更宽松的匹配
-  if (results.length === 0) {
-    debugLog('前两种方法都失败，尝试最宽松的匹配...')
+  debugLog(`找到 ${profileMatches.length} 个 profile 链接`)
+  
+  // 然后找到所有的玩家名称
+  const nameRegex = /<span class="list_name__[^"]*">([^<]+)<\/span>/g
+  const nameMatches = []
+  let nameMatch
+  
+  while ((nameMatch = nameRegex.exec(html)) !== null) {
+    nameMatches.push(nameMatch[1].trim())
+  }
+  
+  debugLog(`找到 ${nameMatches.length} 个玩家名称: ${nameMatches.join(', ')}`)
+  
+  // 假设链接和名称的顺序是对应的
+  const minLength = Math.min(profileMatches.length, nameMatches.length)
+  for (let i = 0; i < minLength; i++) {
+    const profile = profileMatches[i]
+    const playerName = nameMatches[i]
     
-    // 查找包含 profile 的任何链接
-    const anyProfileRegex = /href="[^"]*\/profile\/(\d+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/g
-    let anyMatch
-    
-    while ((anyMatch = anyProfileRegex.exec(html)) !== null) {
-      const playerId = anyMatch[1]
-      const possibleName = anyMatch[2].trim()
-      
-      // 过滤掉明显不是玩家名的内容
-      if (possibleName && !possibleName.includes('profile') && possibleName.length > 0) {
-        results.push({
-          playerId,
-          playerName: possibleName,
-          url: `${config.baseUrl}/${config.locale}/profile/${playerId}`
-        })
-        debugLog(`备用方案找到: ${possibleName} (ID: ${playerId})`)
-      }
-    }
+    results.push({
+      playerId: profile.playerId,
+      playerName: playerName,
+      url: profile.fullUrl  // 使用拼接后的完整URL
+    })
+    debugLog(`配对成功: ${playerName} (ID: ${profile.playerId})`)
   }
   
   debugLog(`搜索结果解析完成，共找到 ${results.length} 个玩家`)
@@ -343,8 +365,14 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     const cacheKey = `search:${playerName}`
     const cached = playerSearchCache.get(cacheKey)
     if (cached) {
-      debugLog(`使用缓存的搜索结果: ${playerName}`)
-      return cached
+      debugLog(`使用缓存的搜索结果: ${playerName}，缓存结果数量: ${cached.length}`)
+      // 如果缓存的结果只有1个且实际应该有更多，清理缓存重新获取
+      if (cached.length === 1) {
+        debugLog('缓存结果可能不完整，清理缓存重新获取')
+        playerSearchCache.clear()
+      } else {
+        return cached
+      }
     }
 
     debugLog(`开始搜索玩家: ${playerName}`)
@@ -355,6 +383,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     
     try {
       const html = await ctx.http.get(searchUrl, { headers: buildHeaders(), timeout: HTTP_TIMEOUT })
+      debugLog(`获取到HTML，长度: ${html.length}`)
       
       if (looksLikeLoginPage(html)) {
         throw new Error('需要登录 Cookie 才能搜索玩家')
@@ -362,7 +391,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       
       const results = parsePlayerSearchResults(html)
       playerSearchCache.set(cacheKey, results)
-      debugLog(`搜索完成，找到 ${results.length} 个结果`)
+      debugLog(`搜索完成，找到 ${results.length} 个结果，已缓存`)
       
       return results
     } catch (e: any) {
@@ -1000,156 +1029,258 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     return false
   }
 
-  // 主命令：排位查询 <玩家ID>
-  ctx.command('排位查询 <playerId:string>', '查询 SF6 排位积分信息')
-    .example('排位查询 1234567890')
+  // 获取用户绑定的玩家ID
+  async function getUserPlayerId(userId: string): Promise<string | null> {
+    try {
+      const bindings = await ctx.database.get('streetfighter6_binding', { userId })
+      return bindings.length > 0 ? bindings[0].playerId : null
+    } catch (e) {
+      warnLog('获取用户绑定ID失败:', e)
+      return null
+    }
+  }
+
+  // 设置用户绑定的玩家ID
+  async function setUserPlayerId(userId: string, playerId: string): Promise<boolean> {
+    try {
+      const existing = await ctx.database.get('streetfighter6_binding', { userId })
+      if (existing.length > 0) {
+        await ctx.database.set('streetfighter6_binding', { userId }, { playerId })
+      } else {
+        await ctx.database.create('streetfighter6_binding', { userId, playerId })
+      }
+      infoLog(`成功设置用户 ${userId} 的玩家ID: ${playerId}`)
+      return true
+    } catch (e) {
+      warnLog('设置用户绑定ID失败:', e)
+      return false
+    }
+  }
+
+  // 删除用户绑定的玩家ID
+  async function removeUserPlayerId(userId: string): Promise<boolean> {
+    try {
+      await ctx.database.remove('streetfighter6_binding', { userId })
+      infoLog(`成功移除用户 ${userId} 的玩家ID绑定`)
+      return true
+    } catch (e) {
+      warnLog('移除用户绑定ID失败:', e)
+      return false
+    }
+  }
+
+  // 绑定ID
+  ctx.command('绑定ID <playerId:string>', '绑定你的 SF6 玩家ID')
+    .example('绑定ID 1234567890')
     .action(async ({ session }, playerId) => {
-      if (!playerId) return '用法：排位查询 <玩家ID>\n例如：排位查询 1234567890'
+      if (!playerId) {
+        return '用法：绑定ID <玩家ID>\n例如：绑定ID 1234567890'
+      }
       
-      // 验证ID格式
-      if (!/^\d{5,}$/.test(playerId.trim())) {
+      const id = playerId.trim()
+      if (!/^\d{5,}$/.test(id)) {
         return '玩家ID格式错误，应该是5位以上的数字。'
       }
-
-      const cdKey = session?.channelId ? `c:${session.channelId}` : `u:${session?.userId ?? 'anon'}`
-      if (inCooldown(cdKey)) return `请稍候再试（冷却 ${COOLDOWN_SEC}s）`
-
-      const id = playerId.trim()
       
-      // 检查是否启用了任何输出
-      if (!config.enableTextOutput && !config.enableScreenshotOutput) {
-        return '错误：文本输出和截图输出都已禁用，请在配置中启用至少一项。'
-      }
-
-      infoLog(`开始查询玩家: ${id}`)
-
-      // 显示等待消息
-      let waitingMessageId: string | undefined
-      if (SHOW_WAITING_MESSAGE && session) {
-        try {
-          const waitingMessage = await session.send(`🔍 正在查询玩家 ${id} 的排位信息，请稍候...`)
-          if (Array.isArray(waitingMessage) && waitingMessage[0]) {
-            waitingMessageId = waitingMessage[0]
-          }
-          debugLog(`显示等待消息: ${waitingMessageId}`)
-        } catch (e) {
-          debugLog('发送等待消息失败:', e)
-        }
-      }
-
       try {
-        // 分别处理文本和截图，避免一个失败影响另一个
-        const results: { text?: RankData; screenshot?: Buffer; errors: string[] } = { errors: [] }
+        infoLog(`开始绑定ID操作，用户: ${session!.userId}, 参数: ${playerId}`)
         
-        // 处理文本输出
-        if (config.enableTextOutput) {
-          debugLog('启用文本输出，开始获取排位数据')
-          try {
-            const data = await getRankDataById(id)
-            results.text = data
-            debugLog(`排位文本信息已准备`)
-          } catch (e: any) {
-            warnLog('排位文本获取失败:', e)
-            results.errors.push(`文本获取失败: ${e?.message || '未知错误'}`)
-          }
+        const success = await setUserPlayerId(session!.userId, id)
+        if (success) {
+          return `已绑定玩家ID：${id}\n之后可直接使用：排位查询 / 胜率查询 / 战斗记录`
+        } else {
+          return '绑定失败，请稍后重试。'
         }
-
-        // 处理截图输出
-        if (config.enableScreenshotOutput) {
-          debugLog('启用截图输出，开始截图')
-          try {
-            const screenshot = await takeScreenshot(id)
-            results.screenshot = screenshot
-            debugLog(`排位截图已准备`)
-          } catch (e: any) {
-            warnLog('排位截图获取失败:', e)
-            results.errors.push(`截图获取失败: ${e?.message || '未知错误'}`)
-          }
-        }
-
-        infoLog(`排位查询完成`)
-        
-        // 撤回等待消息
-        if (waitingMessageId && session?.bot?.deleteMessage) {
-          try {
-            await session.bot.deleteMessage(session.channelId, waitingMessageId)
-            debugLog(`撤回等待消息: ${waitingMessageId}`)
-          } catch (e) {
-            debugLog(`撤回等待消息失败: ${e}`)
-          }
-        }
-
-        // 发送结果 - 分别发送，避免一个失败影响另一个
-        const responses: string[] = []
-        
-        if (results.text) {
-          try {
-            const textOutput = formatRankData(results.text)
-            await session?.send(textOutput)
-            responses.push('文本信息发送成功')
-          } catch (e) {
-            warnLog('文本信息发送失败:', e)
-            responses.push('文本信息发送失败')
-          }
-        }
-        
-        if (results.screenshot) {
-          try {
-            await session?.send(`📸 详细信息截图：`)
-            await session?.send(h.image(results.screenshot, 'image/png'))
-            responses.push('截图发送成功')
-          } catch (e) {
-            warnLog('截图发送失败:', e)
-            responses.push('截图发送失败')
-          }
-        }
-        
-        // 如果有错误，添加错误信息
-        if (results.errors.length > 0) {
-          responses.push(`部分功能失败: ${results.errors.join(', ')}`)
-        }
-        
-        if (responses.length === 0) {
-          return '查询完成但没有可显示的内容'
-        }
-        
-        // 只在所有操作都失败时才返回错误
-        return null // 已经分别发送了，不需要return
-        
       } catch (e: any) {
-        warnLog('查询失败:', e?.message)
+        warnLog('绑定ID操作失败:', e)
+        return `绑定失败：${e?.message || '未知错误'}`
+      }
+    })
+
+  // 解绑ID
+  ctx.command('解绑ID', '清除已绑定的 SF6 玩家ID')
+    .action(async ({ session }) => {
+      try {
+        infoLog(`开始解绑ID操作，用户: ${session!.userId}`)
         
-        // 撤回等待消息
-        if (waitingMessageId && session) {
+        const success = await removeUserPlayerId(session!.userId)
+        if (success) {
+          return '已清除绑定的玩家ID。'
+        } else {
+          return '解绑失败，请稍后重试。'
+        }
+      } catch (e: any) {
+        warnLog('解绑ID操作失败:', e)
+        return `解绑失败：${e?.message || '未知错误'}`
+      }
+    })
+
+  // 主命令：排位查询 [玩家ID]
+  ctx.command('排位查询 [playerId:string]', '查询 SF6 排位积分信息')
+    .example('排位查询 1234567890')
+    .action(async ({ session }, playerId) => {
+      try {
+        infoLog(`开始排位查询，用户: ${session?.userId}, 参数: ${playerId}`)
+        
+        let id = playerId?.trim()
+        if (!id) {
+          // 如果没有提供参数，尝试获取绑定的ID
+          id = await getUserPlayerId(session!.userId)
+        }
+        infoLog(`最终使用的玩家ID: ${id}`)
+        
+        if (!id) {
+          warnLog('排位查询失败：未绑定玩家ID且未提供参数')
+          return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+        }
+        if (!/^\d{5,}$/.test(id)) {
+          warnLog(`排位查询失败：ID格式错误 - ${id}`)
+          return '玩家ID格式错误，应该是5位以上的数字。'
+        }
+
+        const cdKey = session?.channelId ? `c:${session.channelId}` : `u:${session?.userId ?? 'anon'}`
+        if (inCooldown(cdKey)) return `请稍候再试（冷却 ${COOLDOWN_SEC}s）`
+        
+        // 检查是否启用了任何输出
+        if (!config.enableTextOutput && !config.enableScreenshotOutput) {
+          return '错误：文本输出和截图输出都已禁用，请在配置中启用至少一项。'
+        }
+
+        infoLog(`开始查询玩家: ${id}`)
+
+        // 显示等待消息
+        let waitingMessageId: string | undefined
+        if (SHOW_WAITING_MESSAGE && session) {
           try {
-            await session.bot.deleteMessage(session.channelId, waitingMessageId)
-            debugLog(`撤回等待消息: ${waitingMessageId}`)
+            const suffix = playerId ? '' : '（使用已绑定ID）'
+            const waitingMessage = await session.send(`🔍 正在查询玩家 ${id} 的排位信息，请稍候...${suffix}`)
+            if (Array.isArray(waitingMessage) && waitingMessage[0]) {
+              waitingMessageId = waitingMessage[0]
+            }
+            debugLog(`显示等待消息: ${waitingMessageId}`)
           } catch (e) {
-            debugLog('撤回等待消息失败:', e)
+            debugLog('发送等待消息失败:', e)
           }
         }
-        
-        if (String(e?.message).includes('Cookie')) {
-          return '排位查询失败：需要有效登录 Cookie。请检查配置中的Cookie设置。'
+
+        try {
+          // 分别处理文本和截图，避免一个失败影响另一个
+          const results: { text?: RankData; screenshot?: Buffer; errors: string[] } = { errors: [] }
+          
+          // 处理文本输出
+          if (config.enableTextOutput) {
+            debugLog('启用文本输出，开始获取排位数据')
+            try {
+              const data = await getRankDataById(id)
+              results.text = data
+              debugLog(`排位文本信息已准备`)
+            } catch (e: any) {
+              warnLog('排位文本获取失败:', e)
+              results.errors.push(`文本获取失败: ${e?.message || '未知错误'}`)
+            }
+          }
+
+          // 处理截图输出
+          if (config.enableScreenshotOutput) {
+            debugLog('启用截图输出，开始截图')
+            try {
+              const screenshot = await takeScreenshot(id)
+              results.screenshot = screenshot
+              debugLog(`排位截图已准备`)
+            } catch (e: any) {
+              warnLog('排位截图获取失败:', e)
+              results.errors.push(`截图获取失败: ${e?.message || '未知错误'}`)
+            }
+          }
+
+          infoLog(`排位查询完成`)
+          
+          // 撤回等待消息
+          if (waitingMessageId && session?.bot?.deleteMessage) {
+            try {
+              await session.bot.deleteMessage(session.channelId, waitingMessageId)
+              debugLog(`撤回等待消息: ${waitingMessageId}`)
+            } catch (e) {
+              debugLog(`撤回等待消息失败: ${e}`)
+            }
+          }
+
+          // 发送结果 - 分别发送，避免一个失败影响另一个
+          const responses: string[] = []
+          
+          if (results.text) {
+            try {
+              const textOutput = formatRankData(results.text)
+              await session?.send(textOutput)
+              responses.push('文本信息发送成功')
+            } catch (e) {
+              warnLog('文本信息发送失败:', e)
+              responses.push('文本信息发送失败')
+            }
+          }
+          
+          if (results.screenshot) {
+            try {
+              await session?.send(`📸 详细信息截图：`)
+              await session?.send(h.image(results.screenshot, 'image/png'))
+              responses.push('截图发送成功')
+            } catch (e) {
+              warnLog('截图发送失败:', e)
+              responses.push('截图发送失败')
+            }
+          }
+          
+          // 如果有错误，添加错误信息
+          if (results.errors.length > 0) {
+            responses.push(`部分功能失败: ${results.errors.join(', ')}`)
+          }
+          
+          if (responses.length === 0) {
+            return '查询完成但没有可显示的内容'
+          }
+          
+          // 只在所有操作都失败时才返回错误
+          return null // 已经分别发送了，不需要return
+          
+        } catch (e: any) {
+          warnLog('查询失败:', e?.message)
+          
+          // 撤回等待消息
+          if (waitingMessageId && session) {
+            try {
+              await session.bot.deleteMessage(session.channelId, waitingMessageId)
+              debugLog(`撤回等待消息: ${waitingMessageId}`)
+            } catch (e) {
+              debugLog('撤回等待消息失败:', e)
+            }
+          }
+          
+          if (String(e?.message).includes('Cookie')) {
+            return '排位查询失败：需要有效登录 Cookie。请检查配置中的Cookie设置。'
+          }
+          if (String(e?.message).includes('puppeteer')) {
+            return '截图功能不可用：需要安装 puppeteer 插件。'
+          }
+          return `查询失败：${e?.message || '未知错误'}`
         }
-        if (String(e?.message).includes('puppeteer')) {
-          return '截图功能不可用：需要安装 puppeteer 插件。'
-        }
-        return `查询失败：${e?.message || '未知错误'}`
+      } catch (e: any) {
+        warnLog('排位查询整体失败:', e)
+        return `排位查询失败：${e?.message || '未知错误'}`
       }
     })
 
   // 胜率查询命令
-  ctx.command('胜率查询 <playerId:string>', '查询 SF6 胜率信息')
+  ctx.command('胜率查询 [playerId:string]', '查询 SF6 胜率信息')
     .example('胜率查询 1234567890')
     .action(async ({ session }, playerId) => {
-      if (!playerId) return '用法：胜率查询 <玩家ID>\n例如：胜率查询 1234567890'
-      
-      if (!/^\d+$/.test(playerId)) {
-        return '玩家ID必须是数字。'
+      let id = playerId?.trim()
+      if (!id) {
+        // 如果没有提供参数，尝试获取绑定的ID
+        id = await getUserPlayerId(session!.userId)
       }
+      if (!id) return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+      if (!/^\d{5,}$/.test(id)) return '玩家ID格式错误，应该是5位以上的数字。'
 
-      const id = playerId.trim()
       const userId = session?.userId || 'unknown'
       const cooldownKey = `winrate:${userId}:${id}`
       
@@ -1163,7 +1294,8 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         // 显示等待消息
         let waitingMessageId: string | undefined
         if (SHOW_WAITING_MESSAGE) {
-          const waitingMessage = await session?.send('🔍 正在查询胜率信息，请稍候...')
+          const suffix = playerId ? '' : '（使用已绑定ID）'
+          const waitingMessage = await session?.send(`🔍 正在查询胜率信息，请稍候...${suffix}`)
           if (waitingMessage && Array.isArray(waitingMessage) && waitingMessage[0]) {
             waitingMessageId = waitingMessage[0]
             debugLog(`显示等待消息: ${waitingMessageId}`)
@@ -1270,16 +1402,17 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     })
 
   // 战斗记录查询命令
-  ctx.command('战斗记录 <playerId:string>', '查询 SF6 战斗记录')
+  ctx.command('战斗记录 [playerId:string]', '查询 SF6 战斗记录')
     .example('战斗记录 1234567890')
     .action(async ({ session }, playerId) => {
-      if (!playerId) return '用法：战斗记录 <玩家ID>\n例如：战斗记录 1234567890'
-      
-      if (!/^\d+$/.test(playerId)) {
-        return '玩家ID必须是数字。'
+      let id = playerId?.trim()
+      if (!id) {
+        // 如果没有提供参数，尝试获取绑定的ID
+        id = await getUserPlayerId(session!.userId)
       }
+      if (!id) return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+      if (!/^\d{5,}$/.test(id)) return '玩家ID格式错误，应该是5位以上的数字。'
 
-      const id = playerId.trim()
       const userId = session?.userId || 'unknown'
       const cooldownKey = `battlelog:${userId}:${id}`
       
@@ -1293,7 +1426,8 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         // 显示等待消息
         let waitingMessageId: string | undefined
         if (SHOW_WAITING_MESSAGE) {
-          const waitingMessage = await session?.send('🔍 正在查询战斗记录，请稍候...')
+          const suffix = playerId ? '' : '（使用已绑定ID）'
+          const waitingMessage = await session?.send(`🔍 正在查询战斗记录，请稍候...${suffix}`)
           if (waitingMessage && Array.isArray(waitingMessage) && waitingMessage[0]) {
             waitingMessageId = waitingMessage[0]
             debugLog(`显示等待消息: ${waitingMessageId}`)
@@ -1431,14 +1565,23 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         
         if (results.text && results.text.length > 0) {
           try {
-            let textOutput = `🔍 搜索到 ${results.text.length} 个玩家：\n\n`
-            results.text.forEach((player, index) => {
-              textOutput += `${index + 1}. ${player.playerName}\n`
-              textOutput += `   ID: ${player.playerId}\n`
-              textOutput += `   链接: ${player.url}\n\n`
+            const header = `🔍 搜索到 ${results.text.length} 个玩家：`
+            const lines = results.text.map((player, index) => {
+              return `${index + 1}. ${player.playerName}\n   ID: ${player.playerId}\n   链接: ${player.url}`
             })
-            
-            await session?.send(textOutput.trim())
+            const fullText = [header, '', ...lines].join('\n')
+
+            // 分段发送，避免过长被平台截断
+            const chunks: string[] = []
+            const maxLen = 3500
+            let start = 0
+            while (start < fullText.length) {
+              chunks.push(fullText.slice(start, start + maxLen))
+              start += maxLen
+            }
+            for (const chunk of chunks) {
+              await session?.send(chunk)
+            }
             responses.push('文本信息')
           } catch (e) {
             warnLog('文本发送失败:', e)
