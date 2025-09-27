@@ -1,6 +1,5 @@
 import { Context, Schema, Logger, h } from 'koishi'
-import { readFileSync } from 'fs'
-import { resolve } from 'path'
+
 
 export const name = 'streetfighter6-rank'
 export const inject = ['puppeteer', 'database']
@@ -19,6 +18,7 @@ declare module 'koishi' {
         } | null>
         setCookie(...cookies: Array<{ name: string; value: string; domain: string }>): Promise<void>
         evaluate<T>(fn: () => T): Promise<T>
+        evaluate<T>(fn: (...args: any[]) => T, ...args: any[]): Promise<T>
         screenshot(options: { type: 'png'; fullPage?: boolean }): Promise<Buffer>
         close(): Promise<void>
       }>
@@ -41,6 +41,8 @@ export interface Config {
   locale: 'zh-hans' | 'en-us' | 'ja-jp' | 'ko-kr' | 'zh-hant'
   userAgent: string
   cookie?: string
+  username?: string
+  password?: string
   
   // 功能开关
   enableTextOutput: boolean
@@ -64,6 +66,8 @@ export const Config: Schema<Config> = Schema.intersect([
     ]).default('zh-hans').description('页面语言'),
     userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36').description('浏览器标识'),
     cookie: Schema.string().role('secret').description('登录 Cookie'),
+    username: Schema.string().default('').description('登录账号（提供则优先使用账号密码登录）'),
+    password: Schema.string().role('secret').default('').description('登录密码（提供则优先使用账号密码登录）'),
   }).description('网站连接配置'),
   
   Schema.object({
@@ -152,7 +156,7 @@ export function apply(ctx: Context, config: Config) {
   const COOLDOWN_SEC = 5 // 冷却时间 5 秒
   const SHOW_WAITING_MESSAGE = true // 显示等待消息
 
-  let runtimeCookie = (config.cookie?.trim() || process.env.SF6_COOKIE || '').trim()
+  let runtimeCookie = ((config.username && config.password) ? '' : (config.cookie?.trim() || process.env.SF6_COOKIE || '')).trim()
   const rankCache = new SimpleCache<RankData>(CACHE_TTL)
   const screenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const winRateCache = new SimpleCache<WinRateData>(CACHE_TTL)
@@ -161,6 +165,17 @@ export function apply(ctx: Context, config: Config) {
   const playerSearchCache = new SimpleCache<PlayerSearchResult[]>(CACHE_TTL)
   const playerSearchScreenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const cooldownMap = new Map<string, number>()
+
+  // 如提供账号密码，启动时尝试自动登录以获取会话 Cookie
+  if (config.username && config.password) {
+    (async () => {
+      try {
+        await performLogin()
+      } catch (e) {
+        warnLog('自动登录失败:', e)
+      }
+    })()
+  }
 
   // 增强日志输出
   function debugLog(message: string, ...args: any[]) {
@@ -200,23 +215,98 @@ export function apply(ctx: Context, config: Config) {
     return headers
   }
 
-  async function fetchHtml(url: string): Promise<string> {
-    debugLog('开始请求页面', url)
+  // 使用账号密码执行登录，成功后更新 runtimeCookie
+  async function performLogin(): Promise<void> {
+    if (!config.username || !config.password) return
+    if (!ctx.puppeteer) throw new Error('需要 puppeteer 以执行登录')
+
+    const page = await ctx.puppeteer.page()
     try {
-      const startTime = Date.now()
-      const html = await ctx.http.get(url, { headers: buildHeaders(), timeout: HTTP_TIMEOUT })
-      const endTime = Date.now()
-      debugLog(`页面请求完成，耗时 ${endTime - startTime}ms，页面大小 ${html.length} 字符`)
-      return html
-    } catch (e: any) {
-      const body = e?.response?.data
-      if (e?.response?.status) {
-        warnLog(`HTTP请求失败 ${e.response.status} for ${url}`)
+      await page.setUserAgent(config.userAgent)
+      // 打开入口页
+      await page.goto(`${config.baseUrl}/${config.locale}/`, { waitUntil: 'domcontentloaded', timeout: HTTP_TIMEOUT })
+
+      // 尝试点击“登录/Sign in”等入口（如存在）
+      await page.evaluate(() => {
+        const items = Array.from(document.querySelectorAll('a,button')) as HTMLElement[]
+        const hit = items.find(el => {
+          const t = (el.textContent || '').toLowerCase()
+          const href = (el.getAttribute('href') || '').toLowerCase()
+          return /login|sign\s*in|登录|登入|サインイン/.test(t + ' ' + href)
+        })
+        hit?.click()
+      })
+
+      // 等待页面切换
+      await new Promise(res => setTimeout(res, 1200))
+
+      // 填写并提交表单（尽量宽松地选择输入框）
+      await page.evaluate((u, p) => {
+        const pick = (sels: string[]) => sels.map(s => document.querySelector(s) as HTMLInputElement | null).find(Boolean)
+        const user = pick(['input[type="email"]', 'input[name="email"]', 'input[type="text"]'])
+        const pass = pick(['input[type="password"]'])
+        if (user) { user.focus(); (user as any).value = String(u) }
+        if (pass) { pass.focus(); (pass as any).value = String(p) }
+        const form = document.querySelector('form') as HTMLFormElement | null
+        if (form) form.submit()
+        else (document.querySelector('button, input[type="submit"]') as HTMLElement | null)?.click()
+      }, config.username, config.password)
+
+      // 等待登录完成
+      await new Promise(res => setTimeout(res, 2000))
+
+      const cookieText = await page.evaluate(() => document.cookie)
+      if (cookieText) {
+        runtimeCookie = String(cookieText)
+        infoLog('登录成功，已更新 Cookie')
+      } else {
+        warnLog('登录完成但未获取到 Cookie')
       }
-      if (typeof body === 'string') return body
-      throw e
+    } finally {
+      await page.close()
     }
   }
+
+async function fetchHtml(url: string): Promise<string> {
+  debugLog('开始请求页面', url)
+
+  // 若配置了账号密码且尚未建立会话，先尝试登录
+  if (config.username && config.password && !runtimeCookie) {
+    try {
+      await performLogin()
+    } catch (e) {
+      warnLog('自动登录失败，将直接请求:', e)
+    }
+  }
+
+  try {
+    const startTime = Date.now()
+    let html = await ctx.http.get(url, { headers: buildHeaders(), timeout: HTTP_TIMEOUT })
+    const endTime = Date.now()
+    debugLog(`页面请求完成，耗时 ${endTime - startTime}ms，页面大小 ${html.length} 字符`)
+
+    // 如果返回的是登录页，且配置了账号密码，自动登录并重试一次
+    if (looksLikeLoginPage(html) && config.username && config.password) {
+      infoLog('检测到登录页面，尝试自动登录后重试')
+      try {
+        await performLogin()
+        html = await ctx.http.get(url, { headers: buildHeaders(), timeout: HTTP_TIMEOUT })
+      } catch (err) {
+        warnLog('自动登录或重试失败:', err)
+      }
+    }
+
+    return html
+  } catch (e: any) {
+    const body = e?.response?.data
+    if (e?.response?.status) {
+      warnLog(`HTTP请求失败 ${e.response.status} for ${url}`)
+    }
+    if (typeof body === 'string') return body
+    throw e
+  }
+}
+
 
   // 检测是否被重定向到登录页
   function looksLikeLoginPage(html: string): boolean {
@@ -275,7 +365,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       const relativePath = hrefMatch[1]
       const playerId = hrefMatch[2]
       // 修正URL拼接 - config.baseUrl已经包含了主域名，所以直接拼接相对路径
-      const fullUrl = `https://www.streetfighter.com${relativePath}`
+      const fullUrl = new URL(relativePath, config.baseUrl).toString()
       debugLog(`第 ${i + 1} 个li找到玩家ID: ${playerId}`)
       debugLog(`第 ${i + 1} 个li相对路径: ${relativePath}`)
       debugLog(`第 ${i + 1} 个li完整URL: ${fullUrl}`)
@@ -323,7 +413,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       
       // 避免重复添加相同的玩家ID
       if (!profileMatches.find(p => p.playerId === playerId)) {
-        const fullUrl = fullPath.startsWith('http') ? fullPath : `https://www.streetfighter.com${fullPath}`
+        const fullUrl = fullPath.startsWith('http') ? fullPath : new URL(fullPath, config.baseUrl).toString()
         profileMatches.push({
           relativePath: fullPath,
           playerId: playerId,

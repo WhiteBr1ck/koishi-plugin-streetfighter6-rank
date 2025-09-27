@@ -8,6 +8,11 @@ yarn-debug.log
 yarn-error.log
 tsconfig.tsbuildinfo
 
+# Local temp files / patches
+temp_patch.txt
+*.patch
+patch.tmp
+
 .eslintcache
 .DS_Store
 .idea
