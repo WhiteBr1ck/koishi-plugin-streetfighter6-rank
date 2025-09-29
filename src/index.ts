@@ -16,11 +16,19 @@ declare module 'koishi' {
         waitForSelector(selector: string, options?: { timeout?: number }): Promise<void>
         $(selector: string): Promise<{
           screenshot(options: { type: 'png' }): Promise<Buffer>
+          click(options?: any): Promise<void>
+          evaluate<T>(fn: (el: any, ...args: any[]) => T, ...args: any[]): Promise<T>
+          type(text: string, options?: { delay: number }): Promise<void>
+          press(key: string): Promise<void>
         } | null>
+        $$(selector: string): Promise<any[]>
         setCookie(...cookies: Array<{ name: string; value: string; domain: string }>): Promise<void>
-        evaluate<T>(fn: () => T): Promise<T>
+        cookies(...urls: string[]): Promise<Array<{ name: string; value: string; domain: string }>>
+        evaluate<T>(fn: (...args: any[]) => T, ...args: any[]): Promise<T>
         screenshot(options: { type: 'png'; fullPage?: boolean }): Promise<Buffer>
         close(): Promise<void>
+        url(): string
+        waitForNavigation(options?: any): Promise<any>
       }>
     }
   }
@@ -41,12 +49,17 @@ export interface Config {
   locale: 'zh-hans' | 'en-us' | 'ja-jp' | 'ko-kr' | 'zh-hant'
   userAgent: string
   cookie?: string
-  
+
+  // 自动登录配置
+  capcomEmail?: string
+  capcomPassword?: string
+  cookieRefreshInterval: number
+
   // 功能开关
   enableTextOutput: boolean
   enableScreenshotOutput: boolean
   enableForwardMessage: boolean
-  
+
   // 调试选项
   debug: boolean
 }
@@ -63,16 +76,23 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('ko-kr').description('한국어'),
     ]).default('zh-hans').description('页面语言'),
     userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36').description('浏览器标识'),
-    cookie: Schema.string().role('secret').description('登录 Cookie'),
+    cookie: Schema.string().role('secret').description('手动设置的登录 Cookie（如配置了自动登录则优先使用自动登录）'),
   }).description('网站连接配置'),
-  
+
+  Schema.object({
+    // 自动登录配置
+    capcomEmail: Schema.string().role('secret').description('CAPCOM ID 邮箱（配置后将自动登录获取Cookie）'),
+    capcomPassword: Schema.string().role('secret').description('CAPCOM ID 密码'),
+    cookieRefreshInterval: Schema.number().default(0).description('自动刷新 Cookie 的时间间隔（小时），设置为 0 则禁用自动刷新。'),
+  }).description('自动登录配置'),
+
   Schema.object({
     // 功能开关
     enableTextOutput: Schema.boolean().default(true).description('启用文本信息输出'),
     enableScreenshotOutput: Schema.boolean().default(true).description('启用截图输出'),
     enableForwardMessage: Schema.boolean().default(false).description('启用合并转发消息（玩家搜索结果）'),
   }).description('功能开关'),
-  
+
   Schema.object({
     // 调试选项
     debug: Schema.boolean().default(false).description('输出详细调试日志'),
@@ -103,7 +123,8 @@ export const Config: Schema<Config> = Schema.intersect([
     totalBattles: number
     winRate: number
     url: string
-  }const logger = new Logger('streetfighter6-rank')
+  }
+const logger = new Logger('streetfighter6-rank')
 
 // 简单内存缓存
 class SimpleCache<V> {
@@ -153,6 +174,10 @@ export function apply(ctx: Context, config: Config) {
   const SHOW_WAITING_MESSAGE = true // 显示等待消息
 
   let runtimeCookie = (config.cookie?.trim() || process.env.SF6_COOKIE || '').trim()
+  let loginInProgress = false
+  let lastLoginAttempt = 0
+  const LOGIN_RETRY_INTERVAL = 300000 // 5分钟重试间隔
+
   const rankCache = new SimpleCache<RankData>(CACHE_TTL)
   const screenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const winRateCache = new SimpleCache<WinRateData>(CACHE_TTL)
@@ -175,6 +200,312 @@ export function apply(ctx: Context, config: Config) {
 
   function warnLog(message: string, ...args: any[]) {
     log.warn(`[WARN] ${message}`, ...args)
+  }
+
+  // 自动登录到CAPCOM ID获取Cookie
+  async function performAutoLogin(force: boolean = false): Promise<string | null> {
+    if (!config.capcomEmail || !config.capcomPassword) {
+      debugLog('未配置CAPCOM登录信息，跳过自动登录')
+      return null
+    }
+
+    if (loginInProgress) {
+      debugLog('登录正在进行中，跳过重复登录')
+      return null
+    }
+
+    const now = Date.now()
+    // 仅在非强制模式下检查时间间隔
+    if (!force && lastLoginAttempt && (now - lastLoginAttempt) < LOGIN_RETRY_INTERVAL) {
+      debugLog(`距离上次登录尝试不足${LOGIN_RETRY_INTERVAL / 60000}分钟，跳过登录`)
+      return null
+    }
+
+    if (!ctx.puppeteer) {
+      warnLog('自动登录需要 puppeteer 服务，请安装 koishi-plugin-puppeteer')
+      return null
+    }
+
+    loginInProgress = true
+    lastLoginAttempt = now
+
+    infoLog('开始自动登录 CAPCOM ID...')
+
+    const page = await ctx.puppeteer.page()
+
+    try {
+      // 设置浏览器环境
+      await page.setUserAgent(config.userAgent)
+      await page.setViewport({ width: 1920, height: 1080 })
+
+      // 新增：先访问主页检查登录状态
+      debugLog('访问Buckler主页检查登录状态...')
+      await page.goto(`${config.baseUrl}/${config.locale}/`, { waitUntil: 'networkidle2', timeout: 30000 });
+      const mainPageHtml = await page.evaluate(() => document.documentElement.outerHTML);
+
+      // 通过检查页面是否包含特定的个人资料链接来判断是否已登录
+      const isLoggedIn = !looksLikeLoginPage(mainPageHtml) && /profile\/\d+/.test(mainPageHtml);
+
+      if (isLoggedIn) {
+          debugLog('检测到已登录状态，直接获取Cookie');
+          const cookies = await page.cookies();
+          const cookieString = cookies
+            .filter(cookie => cookie.domain.includes('streetfighter.com') || cookie.domain.includes('capcom.com'))
+            .map(cookie => `${cookie.name}=${cookie.value}`)
+            .join('; ');
+
+          if (cookieString) {
+            infoLog('已处于登录状态，成功获取Cookie');
+            return cookieString;
+          } else {
+            debugLog('虽检测到登录状态，但未能获取到有效Cookie，继续执行标准登录流程...');
+          }
+      } else {
+        debugLog('未检测到登录状态，执行标准登录流程...');
+      }
+
+
+      // 第一步：直接访问登录页面
+      const loginUrl = `${config.baseUrl}/${config.locale}/auth/loginep?redirect_url=/`
+      debugLog(`直接访问登录页面: ${loginUrl}`)
+      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 })
+
+      // 等待页面加载完成，然后检查当前页面内容
+      debugLog('分析登录页面结构...')
+      const currentUrl = page.url()
+      debugLog(`当前页面URL: ${currentUrl}`)
+
+      const pageContent = await page.evaluate(() => document.body.innerText.toLowerCase())
+      debugLog(`页面内容关键词: ${pageContent.substring(0, 200)}`)
+
+      // 第二步：处理Cookie接受界面
+      if (pageContent.includes('cookies') || pageContent.includes('cookie')) {
+        debugLog('检测到Cookie接受界面，尝试点击接受按钮...')
+        try {
+          await page.waitForSelector('#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll', { timeout: 5000 })
+          const cookieBtn = await page.$('#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll')
+          if (cookieBtn) {
+            debugLog('找到Cookie同意按钮，点击...')
+            await cookieBtn.click()
+            await new Promise(resolve => setTimeout(resolve, 3000)) // 等待Cookie处理完成
+            debugLog('Cookie同意完成')
+          }
+        } catch (e) {
+          debugLog('Cookie按钮处理失败，尝试继续:', e)
+        }
+      }
+
+      // 第三步：等待并填写登录表单
+      debugLog('等待登录表单加载...')
+
+      let emailInput = null
+      try {
+        debugLog('寻找邮箱输入框: input[type="email"]')
+        await page.waitForSelector('input[type="email"]', { timeout: 10000 })
+        emailInput = await page.$('input[type="email"]')
+        if (emailInput) {
+          debugLog('成功找到邮箱输入框')
+        }
+      } catch (e) {
+        debugLog(`邮箱输入框加载失败: ${e}`)
+        throw new Error('无法找到邮箱输入框，登录页面可能未正确加载')
+      }
+
+      // 寻找密码输入框
+      let passwordInput = null
+      try {
+        debugLog('寻找密码输入框: .auth0-lock-input-block.auth0-lock-input-password input')
+        passwordInput = await page.$('.auth0-lock-input-block.auth0-lock-input-password input')
+        if (!passwordInput) {
+          debugLog('尝试其他密码输入框选择器...')
+          passwordInput = await page.$('input[type="password"]')
+        }
+        if (passwordInput) {
+          debugLog('成功找到密码输入框')
+        }
+      } catch (e) {
+        debugLog(`密码输入框查找失败: ${e}`)
+      }
+
+      if (!passwordInput) {
+        throw new Error('无法找到密码输入框')
+      }
+
+      // 填写登录信息
+      debugLog('填写登录信息...')
+
+      // 填写邮箱，增加等待时间和验证
+      debugLog('开始填写邮箱...')
+      await emailInput.click()
+      await new Promise(resolve => setTimeout(resolve, 500)) // 点击后等待
+      await emailInput.evaluate(el => el.value = '') // 清空邮箱输入框
+      await new Promise(resolve => setTimeout(resolve, 300)) // 清空后等待
+
+      // 慢速输入邮箱
+      await emailInput.type(config.capcomEmail, { delay: 200 })
+      await new Promise(resolve => setTimeout(resolve, 500)) // 输入后等待
+
+      // 验证邮箱输入是否正确
+      const emailValue = await emailInput.evaluate(el => el.value)
+      debugLog(`邮箱输入验证: 期望=${config.capcomEmail}, 实际=${emailValue}`)
+      if (emailValue !== config.capcomEmail) {
+        debugLog('邮箱输入不完整，重新输入...')
+        await emailInput.evaluate(el => el.value = '')
+        await new Promise(resolve => setTimeout(resolve, 300))
+        await emailInput.type(config.capcomEmail, { delay: 300 })
+        await new Promise(resolve => setTimeout(resolve, 500))
+
+        // 再次验证
+        const emailValue2 = await emailInput.evaluate(el => el.value)
+        debugLog(`邮箱二次输入验证: 期望=${config.capcomEmail}, 实际=${emailValue2}`)
+      }
+
+      // 填写密码，同样增加等待时间
+      debugLog('开始填写密码...')
+      await passwordInput.click()
+      await new Promise(resolve => setTimeout(resolve, 500)) // 点击后等待
+      await passwordInput.evaluate(el => el.value = '') // 清空密码输入框
+      await new Promise(resolve => setTimeout(resolve, 300)) // 清空后等待
+
+      // 慢速输入密码
+      await passwordInput.type(config.capcomPassword, { delay: 200 })
+      await new Promise(resolve => setTimeout(resolve, 500)) // 输入后等待
+
+      // 验证密码输入长度（不打印密码内容）
+      const passwordValue = await passwordInput.evaluate(el => el.value)
+      debugLog(`密码输入验证: 期望长度=${config.capcomPassword.length}, 实际长度=${passwordValue.length}`)
+      if (passwordValue.length !== config.capcomPassword.length) {
+        debugLog('密码输入不完整，重新输入...')
+        await passwordInput.evaluate(el => el.value = '')
+        await new Promise(resolve => setTimeout(resolve, 300))
+        await passwordInput.type(config.capcomPassword, { delay: 300 })
+        await new Promise(resolve => setTimeout(resolve, 500))
+
+        // 再次验证
+        const passwordValue2 = await passwordInput.evaluate(el => el.value)
+        debugLog(`密码二次输入验证: 期望长度=${config.capcomPassword.length}, 实际长度=${passwordValue2.length}`)
+      }
+
+      debugLog('登录信息填写完成，准备提交表单')
+      // 额外等待确保所有输入都已完成
+      await new Promise(resolve => setTimeout(resolve, 1000))
+
+      // 提交表单
+      debugLog('提交登录表单...')
+      const submitSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button[class*="submit"]',
+        'button[class*="login"]',
+        'button[data-testid*="submit"]',
+        'button[data-testid*="login"]',
+        '.submit-btn',
+        '[role="button"][class*="submit"]'
+      ]
+
+      let formSubmitted = false
+      for (const selector of submitSelectors) {
+        try {
+          const submitBtn = await page.$(selector)
+          if (submitBtn) {
+            debugLog(`找到提交按钮: ${selector}`)
+            await submitBtn.click()
+            formSubmitted = true
+            break
+          }
+        } catch (e) {
+          debugLog(`提交按钮选择器 ${selector} 失败: ${e}`)
+        }
+      }
+
+      if (!formSubmitted) {
+        // 尝试按回车提交
+        debugLog('尝试按回车提交表单...')
+        await passwordInput.press('Enter')
+      }
+
+      // 等待登录完成并跳转
+      debugLog('等待登录完成...')
+      try {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 })
+      } catch (e) {
+        debugLog('等待导航超时，检查是否有错误消息...')
+
+        // 检查页面是否有错误信息
+        const errorElements = await page.$$('.error, .alert, [class*="error"], [class*="alert"], [data-testid*="error"]')
+        if (errorElements.length > 0) {
+          const errorText = await page.evaluate(() => {
+            const errors = document.querySelectorAll('.error, .alert, [class*="error"], [class*="alert"], [data-testid*="error"]')
+            return Array.from(errors).map(el => el.textContent).join('; ')
+          })
+          throw new Error(`登录失败: ${errorText}`)
+        }
+      }
+
+      // 等待额外时间确保所有cookie都已设置
+      await new Promise(resolve => setTimeout(resolve, 3000))
+
+      // 访问Buckler页面确保获得完整的Cookie
+      debugLog('访问Buckler确保获得完整Cookie...')
+      try {
+        await page.goto(`${config.baseUrl}/${config.locale}/`, { waitUntil: 'networkidle2', timeout: 30000 })
+      } catch (e) {
+        debugLog('访问Buckler页面失败，但继续尝试获取Cookie...')
+      }
+
+      // 获取所有Cookie
+      const cookies = await page.cookies()
+      const cookieString = cookies
+        .filter(cookie => cookie.domain.includes('streetfighter.com') || cookie.domain.includes('capcom.com'))
+        .map(cookie => `${cookie.name}=${cookie.value}`)
+        .join('; ')
+
+      if (cookieString) {
+        infoLog('自动登录成功，已获取Cookie')
+        debugLog(`获得Cookie长度: ${cookieString.length}`)
+        return cookieString
+      } else {
+        throw new Error('登录完成但未获取到有效Cookie')
+      }
+
+    } catch (e: any) {
+      warnLog('自动登录失败:', e?.message)
+      return null
+    } finally {
+      loginInProgress = false
+      await page.close()
+    }
+  }
+
+  // 检查并更新Cookie
+  async function ensureValidCookie(): Promise<boolean> {
+    // 优先使用自动登录获取的Cookie
+    if (config.capcomEmail && config.capcomPassword && !runtimeCookie) {
+      debugLog('检测到配置了自动登录但无Cookie，尝试自动登录')
+      const newCookie = await performAutoLogin()
+      if (newCookie) {
+        runtimeCookie = newCookie
+        infoLog('已通过自动登录更新Cookie')
+        return true
+      }
+    }
+
+    // 如果有配置的Cookie但自动登录账号密码也配置了，定期刷新
+    if (config.capcomEmail && config.capcomPassword && runtimeCookie && config.cookieRefreshInterval > 0) {
+      const now = Date.now()
+      const refreshIntervalMs = config.cookieRefreshInterval * 3600000
+      if (lastLoginAttempt && (now - lastLoginAttempt) > refreshIntervalMs) { // 达到刷新间隔后重新登录
+        debugLog(`Cookie刷新间隔已到（${config.cookieRefreshInterval}小时），尝试重新登录刷新`)
+        const newCookie = await performAutoLogin()
+        if (newCookie) {
+          runtimeCookie = newCookie
+          infoLog('已刷新Cookie')
+          return true
+        }
+      }
+    }
+
+    return !!runtimeCookie
   }
 
   function profileUrl(id: string) {
@@ -202,6 +533,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function fetchHtml(url: string): Promise<string> {
     debugLog('开始请求页面', url)
+
+    // 确保有有效的Cookie
+    await ensureValidCookie()
+
     try {
       const startTime = Date.now()
       const html = await ctx.http.get(url, { headers: buildHeaders(), timeout: HTTP_TIMEOUT })
@@ -231,6 +566,20 @@ export function apply(ctx: Context, config: Config) {
     
     // 只有既有登录关键词又有登录表单时才认为是登录页
     return hasLoginKeywords && hasLoginForm
+  }
+
+  // 诊断截图失败原因
+  async function diagnoseScreenshotFailure(page: any): Promise<Error> {
+    const pageHtml = await page.evaluate(() => document.documentElement.outerHTML);
+    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
+
+    if (looksLikeLoginPage(pageHtml)) {
+      return new Error('您可能尚未登录或Cookie已失效。');
+    }
+    if (pageText.includes('error') || pageText.includes('エラー') || pageText.includes('エラーが発生しました')) {
+      return new Error('目标页面报告了一个错误。');
+    }
+    return new Error('找不到预期的页面内容，网站布局可能已变更。');
   }
 
 // 解析玩家搜索结果页面
@@ -290,7 +639,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       const playerName = nameMatch[1].trim()
       debugLog(`第 ${i + 1} 个li找到玩家名称: ${playerName}`)
       
-      if (playerId && playerName) {
+      if (playerId && playerName && !results.find(r => r.playerId === playerId)) {
         results.push({
           playerId,
           playerName,
@@ -352,12 +701,14 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     const profile = profileMatches[i]
     const playerName = nameMatches[i]
     
-    results.push({
-      playerId: profile.playerId,
-      playerName: playerName,
-      url: profile.fullUrl  // 使用拼接后的完整URL
-    })
-    debugLog(`配对成功: ${playerName} (ID: ${profile.playerId})`)
+    if (!results.find(r => r.playerId === profile.playerId)) {
+      results.push({
+        playerId: profile.playerId,
+        playerName: playerName,
+        url: profile.fullUrl  // 使用拼接后的完整URL
+      })
+      debugLog(`配对成功: ${playerName} (ID: ${profile.playerId})`)
+    }
   }
   
   debugLog(`搜索结果解析完成，共找到 ${results.length} 个玩家`)
@@ -467,12 +818,9 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       }
       
       if (!element) {
-        // 如果没有找到特定元素，截取整个可视区域
-        debugLog('未找到特定元素，截取整个页面')
-        const screenshot = await page.screenshot({ type: 'png', fullPage: true })
-        playerSearchScreenshotCache.set(cacheKey, screenshot)
-        debugLog(`搜索结果截图已缓存: ${playerName}`)
-        return screenshot
+        // 如果没有找到特定元素，进行诊断
+        debugLog('未找到特定元素，开始诊断失败原因...')
+        throw await diagnoseScreenshotFailure(page)
       }
       
       // 截取找到的元素
@@ -796,11 +1144,9 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         return screenshot
       }
       
-      // 最后兜底：截取整个页面
-      warnLog('所有选择器失败，截取整个页面')
-      const screenshot = await page.screenshot({ type: 'png', fullPage: false })
-      screenshotCache.set(cacheKey, screenshot)
-      return screenshot
+      // 所有选择器失败，进行诊断
+      warnLog('所有选择器失败，开始诊断失败原因...')
+      throw await diagnoseScreenshotFailure(page)
       
     } finally {
       await page.close()
@@ -872,31 +1218,18 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       }
       
       // 截图指定区域或整个页面
-      let screenshot: Buffer
-      try {
-        // 尝试截取指定的winning_rate_winning_rate区域
-        const element = await page.$('[class*="winning_rate_winning_rate"]')
-        if (element) {
-          debugLog('找到winning_rate_winning_rate元素，截取指定区域')
-          screenshot = await element.screenshot({ type: 'png' })
-        } else {
-          debugLog('未找到winning_rate_winning_rate元素，截取整个页面')
-          screenshot = await page.screenshot({
-            fullPage: true,
-            type: 'png'
-          })
-        }
-      } catch (e) {
-        debugLog('区域截图失败，使用整页截图')
-        screenshot = await page.screenshot({
-          fullPage: true,
-          type: 'png'
-        })
+      // 尝试截取指定的winning_rate_winning_rate区域
+      const element = await page.$('[class*="winning_rate_winning_rate"]')
+      if (element) {
+        debugLog('找到winning_rate_winning_rate元素，截取指定区域')
+        const screenshot = await element.screenshot({ type: 'png' })
+        winRateScreenshotCache.set(cacheKey, screenshot)
+        infoLog(`成功完成胜率截图并缓存: ${id}`)
+        return screenshot
+      } else {
+        debugLog('未找到winning_rate_winning_rate元素，开始诊断失败原因...')
+        throw await diagnoseScreenshotFailure(page)
       }
-      
-      winRateScreenshotCache.set(cacheKey, screenshot)
-      infoLog(`成功完成胜率截图并缓存: ${id}`)
-      return screenshot
       
     } finally {
       await page.close()
@@ -968,31 +1301,18 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       }
       
       // 截图指定区域或整个页面
-      let screenshot: Buffer
-      try {
-        // 尝试截取指定的battlelog_inner区域
-        const element = await page.$('[class*="battlelog_inner"]')
-        if (element) {
-          debugLog('找到battlelog_inner元素，截取指定区域')
-          screenshot = await element.screenshot({ type: 'png' })
-        } else {
-          debugLog('未找到battlelog_inner元素，截取整个页面')
-          screenshot = await page.screenshot({
-            fullPage: true,
-            type: 'png'
-          })
-        }
-      } catch (e) {
-        debugLog('区域截图失败，使用整页截图')
-        screenshot = await page.screenshot({
-          fullPage: true,
-          type: 'png'
-        })
+      // 尝试截取指定的battlelog_inner区域
+      const element = await page.$('[class*="battlelog_inner"]')
+      if (element) {
+        debugLog('找到battlelog_inner元素，截取指定区域')
+        const screenshot = await element.screenshot({ type: 'png' })
+        battlelogScreenshotCache.set(cacheKey, screenshot)
+        infoLog(`成功完成战斗记录截图并缓存: ${id}`)
+        return screenshot
+      } else {
+        debugLog('未找到battlelog_inner元素，开始诊断失败原因...')
+        throw await diagnoseScreenshotFailure(page)
       }
-      
-      battlelogScreenshotCache.set(cacheKey, screenshot)
-      infoLog(`成功完成战斗记录截图并缓存: ${id}`)
-      return screenshot
       
     } finally {
       await page.close()
@@ -1039,6 +1359,52 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     } catch (e) {
       warnLog('获取用户绑定ID失败:', e)
       return null
+    }
+  }
+
+  // 解析查询参数（支持@用户或直接输入玩家ID）
+  async function parseQueryParam(session: any, param?: string): Promise<{ playerId: string | null; targetInfo: string }> {
+    debugLog(`解析查询参数: ${param}`)
+
+    if (!param || param.trim() === '') {
+      // 没有参数，使用当前用户的绑定ID
+      const playerId = await getUserPlayerId(session.userId)
+      return {
+        playerId,
+        targetInfo: playerId ? '（使用已绑定ID）' : ''
+      }
+    }
+
+    const trimmedParam = param.trim()
+
+    // 检查是否是@用户格式
+    if (session.elements && session.elements.length > 0) {
+      // 查找@元素
+      const atElement = session.elements.find((el: any) => el.type === 'at')
+      if (atElement && atElement.attrs?.id) {
+        const targetUserId = atElement.attrs.id
+        debugLog(`找到@用户: ${targetUserId}`)
+
+        const playerId = await getUserPlayerId(targetUserId)
+        return {
+          playerId,
+          targetInfo: playerId ? `（查询用户 <@${targetUserId}> 的数据）` : ''
+        }
+      }
+    }
+
+    // 检查是否是纯数字ID格式
+    if (/^\d{5,}$/.test(trimmedParam)) {
+      return {
+        playerId: trimmedParam,
+        targetInfo: ''
+      }
+    }
+
+    // 其他情况认为是无效参数
+    return {
+      playerId: null,
+      targetInfo: ''
     }
   }
 
@@ -1117,23 +1483,30 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       }
     })
 
-  // 主命令：排位查询 [玩家ID]
-  ctx.command('排位查询 [playerId:string]', '查询 SF6 排位积分信息')
+  // 主命令：排位查询 [玩家ID或@用户]
+  ctx.command('排位查询 [param:text]', '查询 SF6 排位积分信息')
     .example('排位查询 1234567890')
-    .action(async ({ session }, playerId) => {
+    .example('排位查询 @用户')
+    .action(async ({ session }, param) => {
       try {
-        infoLog(`开始排位查询，用户: ${session?.userId}, 参数: ${playerId}`)
-        
-        let id = playerId?.trim()
-        if (!id) {
-          // 如果没有提供参数，尝试获取绑定的ID
-          id = await getUserPlayerId(session!.userId)
-        }
+        infoLog(`开始排位查询，用户: ${session?.userId}, 参数: ${param}`)
+
+        // 使用新的参数解析函数
+        const { playerId: id, targetInfo } = await parseQueryParam(session, param)
         infoLog(`最终使用的玩家ID: ${id}`)
-        
+
         if (!id) {
-          warnLog('排位查询失败：未绑定玩家ID且未提供参数')
-          return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+          if (param && param.trim()) {
+            // 有参数但解析失败
+            if (session.elements?.some((el: any) => el.type === 'at')) {
+              return '该用户还未绑定街霸6玩家ID。请提醒其使用：绑定ID <玩家ID>'
+            } else {
+              return '参数格式错误。请使用：排位查询 <玩家ID> 或 排位查询 @用户'
+            }
+          } else {
+            // 没有参数且当前用户也没绑定
+            return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+          }
         }
         if (!/^\d{5,}$/.test(id)) {
           warnLog(`排位查询失败：ID格式错误 - ${id}`)
@@ -1154,8 +1527,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         let waitingMessageId: string | undefined
         if (SHOW_WAITING_MESSAGE && session) {
           try {
-            const suffix = playerId ? '' : '（使用已绑定ID）'
-            const waitingMessage = await session.send(`🔍 正在查询玩家 ${id} 的排位信息，请稍候...${suffix}`)
+            const waitingMessage = await session.send(`🔍 正在查询玩家 ${id} 的排位信息，请稍候...${targetInfo}`)
             if (Array.isArray(waitingMessage) && waitingMessage[0]) {
               waitingMessageId = waitingMessage[0]
             }
@@ -1232,16 +1604,19 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
             }
           }
           
-          // 如果有错误，添加错误信息
-          if (results.errors.length > 0) {
-            responses.push(`部分功能失败: ${results.errors.join(', ')}`)
-          }
-          
           if (responses.length === 0) {
-            return '查询完成但没有可显示的内容'
+            if (results.errors.length > 0) {
+              return `查询失败，原因如下：\n- ${results.errors.join('\n- ')}`;
+            } else {
+              return '查询完成但没有可显示的内容';
+            }
           }
           
-          // 只在所有操作都失败时才返回错误
+          // 如果只有部分失败，在日志中记录
+          if (results.errors.length > 0) {
+            warnLog(`部分查询功能失败: ${results.errors.join(', ')}`);
+          }
+
           return null // 已经分别发送了，不需要return
           
         } catch (e: any) {
@@ -1272,32 +1647,42 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     })
 
   // 胜率查询命令
-  ctx.command('胜率查询 [playerId:string]', '查询 SF6 胜率信息')
+  ctx.command('胜率查询 [param:text]', '查询 SF6 胜率信息')
     .example('胜率查询 1234567890')
-    .action(async ({ session }, playerId) => {
-      let id = playerId?.trim()
+    .example('胜率查询 @用户')
+    .action(async ({ session }, param) => {
+      // 使用新的参数解析函数
+      const { playerId: id, targetInfo } = await parseQueryParam(session, param)
+
       if (!id) {
-        // 如果没有提供参数，尝试获取绑定的ID
-        id = await getUserPlayerId(session!.userId)
+        if (param && param.trim()) {
+          // 有参数但解析失败
+          if (session.elements?.some((el: any) => el.type === 'at')) {
+            return '该用户还未绑定街霸6玩家ID。请提醒其使用：绑定ID <玩家ID>'
+          } else {
+            return '参数格式错误。请使用：胜率查询 <玩家ID> 或 胜率查询 @用户'
+          }
+        } else {
+          // 没有参数且当前用户也没绑定
+          return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+        }
       }
-      if (!id) return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
       if (!/^\d{5,}$/.test(id)) return '玩家ID格式错误，应该是5位以上的数字。'
 
       const userId = session?.userId || 'unknown'
       const cooldownKey = `winrate:${userId}:${id}`
-      
+
       if (inCooldown(cooldownKey)) {
         return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
       }
 
       try {
         infoLog(`开始查询胜率: ${id}`)
-        
+
         // 显示等待消息
         let waitingMessageId: string | undefined
         if (SHOW_WAITING_MESSAGE) {
-          const suffix = playerId ? '' : '（使用已绑定ID）'
-          const waitingMessage = await session?.send(`🔍 正在查询胜率信息，请稍候...${suffix}`)
+          const waitingMessage = await session?.send(`🔍 正在查询胜率信息，请稍候...${targetInfo}`)
           if (waitingMessage && Array.isArray(waitingMessage) && waitingMessage[0]) {
             waitingMessageId = waitingMessage[0]
             debugLog(`显示等待消息: ${waitingMessageId}`)
@@ -1374,16 +1759,19 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
           }
         }
         
-        // 如果有错误，添加错误信息
-        if (results.errors.length > 0) {
-          responses.push(`部分功能失败: ${results.errors.join(', ')}`)
-        }
-        
         if (responses.length === 0) {
-          return '查询完成但没有可显示的内容'
+          if (results.errors.length > 0) {
+            return `查询失败，原因如下：\n- ${results.errors.join('\n- ')}`;
+          } else {
+            return '查询完成但没有可显示的内容';
+          }
         }
         
-        // 只在所有操作都失败时才返回错误
+        // 如果只有部分失败，在日志中记录
+        if (results.errors.length > 0) {
+          warnLog(`部分查询功能失败: ${results.errors.join(', ')}`);
+        }
+
         return null // 已经分别发送了，不需要return
         
       } catch (e: any) {
@@ -1404,32 +1792,42 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     })
 
   // 战斗记录查询命令
-  ctx.command('战斗记录 [playerId:string]', '查询 SF6 战斗记录')
+  ctx.command('战斗记录 [param:text]', '查询 SF6 战斗记录')
     .example('战斗记录 1234567890')
-    .action(async ({ session }, playerId) => {
-      let id = playerId?.trim()
+    .example('战斗记录 @用户')
+    .action(async ({ session }, param) => {
+      // 使用新的参数解析函数
+      const { playerId: id, targetInfo } = await parseQueryParam(session, param)
+
       if (!id) {
-        // 如果没有提供参数，尝试获取绑定的ID
-        id = await getUserPlayerId(session!.userId)
+        if (param && param.trim()) {
+          // 有参数但解析失败
+          if (session.elements?.some((el: any) => el.type === 'at')) {
+            return '该用户还未绑定街霸6玩家ID。请提醒其使用：绑定ID <玩家ID>'
+          } else {
+            return '参数格式错误。请使用：战斗记录 <玩家ID> 或 战斗记录 @用户'
+          }
+        } else {
+          // 没有参数且当前用户也没绑定
+          return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+        }
       }
-      if (!id) return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
       if (!/^\d{5,}$/.test(id)) return '玩家ID格式错误，应该是5位以上的数字。'
 
       const userId = session?.userId || 'unknown'
       const cooldownKey = `battlelog:${userId}:${id}`
-      
+
       if (inCooldown(cooldownKey)) {
         return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
       }
 
       try {
         infoLog(`开始查询战斗记录: ${id}`)
-        
+
         // 显示等待消息
         let waitingMessageId: string | undefined
         if (SHOW_WAITING_MESSAGE) {
-          const suffix = playerId ? '' : '（使用已绑定ID）'
-          const waitingMessage = await session?.send(`🔍 正在查询战斗记录，请稍候...${suffix}`)
+          const waitingMessage = await session?.send(`🔍 正在查询战斗记录，请稍候...${targetInfo}`)
           if (waitingMessage && Array.isArray(waitingMessage) && waitingMessage[0]) {
             waitingMessageId = waitingMessage[0]
             debugLog(`显示等待消息: ${waitingMessageId}`)
@@ -1624,10 +2022,18 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         }
         
         if (responses.length === 0) {
-          return '搜索完成但没有可显示的内容'
+          if (results.errors.length > 0) {
+            return `搜索失败，原因如下：\n- ${results.errors.join('\n- ')}`;
+          } else {
+            return '搜索完成但没有可显示的内容';
+          }
         }
         
-        // 只在所有操作都失败时才返回错误
+        // 如果只有部分失败，在日志中记录
+        if (results.errors.length > 0) {
+          warnLog(`部分查询功能失败: ${results.errors.join(', ')}`);
+        }
+
         return null // 已经分别发送了，不需要return
         
       } catch (e: any) {
@@ -1641,6 +2047,92 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         }
         return `搜索失败：${e?.message || '未知错误'}`
       }
+    })
+
+  // 手动登录命令
+  ctx.command('SF6登录', '手动登录CAPCOM ID获取Cookie')
+    .action(async ({ session }) => {
+      if (!config.capcomEmail || !config.capcomPassword) {
+        return '请先在插件配置中设置CAPCOM ID邮箱和密码'
+      }
+
+      if (loginInProgress) {
+        return '登录正在进行中，请稍后再试'
+      }
+
+      try {
+        infoLog(`用户 ${session?.userId} 手动触发登录`)
+        const waiting = await session?.send('🔄 正在尝试登录CAPCOM ID，请稍候...')
+
+        const newCookie = await performAutoLogin(true)
+
+        // 撤回等待消息
+        if (waiting && Array.isArray(waiting) && waiting[0] && session?.bot?.deleteMessage) {
+          try {
+            await session.bot.deleteMessage(session.channelId, waiting[0])
+          } catch (e) {
+            debugLog('撤回等待消息失败:', e)
+          }
+        }
+
+        if (newCookie) {
+          runtimeCookie = newCookie
+          return '✅ 登录成功，已获取新的Cookie'
+        } else {
+          return '❌ 登录失败，请检查配置的邮箱密码是否正确'
+        }
+      } catch (e: any) {
+        warnLog('手动登录失败:', e)
+        return `登录失败：${e?.message || '未知错误'}`
+      }
+    })
+
+  // 检查登录状态
+  ctx.command('SF6状态', '检查当前登录状态')
+    .action(async ({ session }) => {
+      const status: string[] = []
+
+      // Cookie状态
+      if (runtimeCookie) {
+        status.push(`✅ Cookie状态：已设置 (${redactCookie(runtimeCookie)})`)
+      } else {
+        status.push('❌ Cookie状态：未设置')
+      }
+
+      // 自动登录配置状态
+      if (config.capcomEmail && config.capcomPassword) {
+        status.push(`✅ 自动登录：已配置 (${config.capcomEmail.replace(/^(.{3}).*(@.*)$/, '$1***$2')})`)
+      } else {
+        status.push('❌ 自动登录：未配置')
+      }
+
+      // 登录状态
+      if (loginInProgress) {
+        status.push('🔄 登录状态：登录中')
+      } else if (lastLoginAttempt) {
+        const timeSinceLogin = Math.floor((Date.now() - lastLoginAttempt) / 60000)
+        status.push(`⏰ 上次登录：${timeSinceLogin}分钟前`)
+      } else {
+        status.push('⭕ 登录状态：未登录')
+      }
+
+      // Puppeteer服务状态
+      if (ctx.puppeteer) {
+        status.push('✅ Puppeteer：可用')
+      } else {
+        status.push('❌ Puppeteer：不可用 (需要安装 koishi-plugin-puppeteer)')
+      }
+
+      return `🔍 Street Fighter 6 插件状态：\n\n${status.join('\n')}`
+    })
+
+  // 清除Cookie
+  ctx.command('SF6清除', '清除当前Cookie')
+    .action(async ({ session }) => {
+      runtimeCookie = ''
+      lastLoginAttempt = 0
+      infoLog(`用户 ${session?.userId} 手动清除Cookie`)
+      return '✅ 已清除当前Cookie，下次查询时将重新获取'
     })
 
   // 资源回收
