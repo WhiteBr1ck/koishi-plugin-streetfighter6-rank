@@ -21,3 +21,7 @@ patch.tmp
 *.ntvs*
 *.njsproj
 *.sln
+
+
+# AI Assistant Instructions
+CLAUDE.md

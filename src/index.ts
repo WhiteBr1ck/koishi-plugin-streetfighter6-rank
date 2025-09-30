@@ -250,7 +250,6 @@ export function apply(ctx: Context, config: Config) {
           debugLog('检测到已登录状态，直接获取Cookie');
           const cookies = await page.cookies();
           const cookieString = cookies
-            .filter(cookie => cookie.domain.includes('streetfighter.com') || cookie.domain.includes('capcom.com'))
             .map(cookie => `${cookie.name}=${cookie.value}`)
             .join('; ');
 
@@ -456,7 +455,6 @@ export function apply(ctx: Context, config: Config) {
       // 获取所有Cookie
       const cookies = await page.cookies()
       const cookieString = cookies
-        .filter(cookie => cookie.domain.includes('streetfighter.com') || cookie.domain.includes('capcom.com'))
         .map(cookie => `${cookie.name}=${cookie.value}`)
         .join('; ')
 
@@ -583,6 +581,26 @@ export function apply(ctx: Context, config: Config) {
   }
 
 // 解析玩家搜索结果页面
+  // 检查并点击Cookie同意按钮
+  async function acceptCookiesIfPresent(page: any) {
+    try {
+      debugLog('检查并处理Cookie同意横幅...');
+      const cookieBtnSelector = '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll';
+      // 使用较短的超时时间来快速检查按钮是否存在
+      await page.waitForSelector(cookieBtnSelector, { timeout: 3000, visible: true });
+      const cookieBtn = await page.$(cookieBtnSelector);
+      if (cookieBtn) {
+        debugLog('找到Cookie同意按钮，正在点击...');
+        await cookieBtn.click();
+        // 等待横幅消失
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        debugLog('Cookie同意按钮已点击');
+      }
+    } catch (e) {
+      debugLog('未找到Cookie同意横幅，或处理失败，继续执行...');
+    }
+  }
+
 function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
   const results: PlayerSearchResult[] = []
   
@@ -791,6 +809,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       }
       
       await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: HTTP_TIMEOUT })
+      await acceptCookiesIfPresent(page)
       
       debugLog('页面加载完成，等待搜索结果元素...')
       
@@ -1087,8 +1106,9 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       // 导航到页面并等待加载
       await page.goto(url, { 
         waitUntil: 'domcontentloaded',
-        timeout: HTTP_TIMEOUT 
+        timeout: HTTP_TIMEOUT
       })
+      await acceptCookiesIfPresent(page)
       
       debugLog('页面导航完成，等待内容加载')
       // 额外等待，确保动态内容加载
@@ -1206,6 +1226,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         waitUntil: 'domcontentloaded', // 改为更快的等待条件
         timeout: 30000  // 增加超时时间到30秒
       })
+      await acceptCookiesIfPresent(page)
       debugLog('页面导航完成，等待内容加载')
       
       // 等待胜率内容加载 - 使用新的winning_rate_winning_rate类
@@ -1289,6 +1310,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         waitUntil: 'domcontentloaded', // 更快的等待条件
         timeout: 30000  // 30秒超时
       })
+      await acceptCookiesIfPresent(page)
       debugLog('页面导航完成，等待内容加载')
       
       // 等待战斗记录内容加载
@@ -1515,6 +1537,15 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
 
         const cdKey = session?.channelId ? `c:${session.channelId}` : `u:${session?.userId ?? 'anon'}`
         if (inCooldown(cdKey)) return `请稍候再试（冷却 ${COOLDOWN_SEC}s）`
+
+        // 自动登录检查
+        if (!await ensureValidCookie()) {
+          if (config.capcomEmail && config.capcomPassword) {
+            return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+          } else {
+            return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+          }
+        }
         
         // 检查是否启用了任何输出
         if (!config.enableTextOutput && !config.enableScreenshotOutput) {
@@ -1676,6 +1707,15 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
       }
 
+      // 自动登录检查
+      if (!await ensureValidCookie()) {
+        if (config.capcomEmail && config.capcomPassword) {
+          return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+        } else {
+          return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+        }
+      }
+
       try {
         infoLog(`开始查询胜率: ${id}`)
 
@@ -1821,6 +1861,15 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
       }
 
+      // 自动登录检查
+      if (!await ensureValidCookie()) {
+        if (config.capcomEmail && config.capcomPassword) {
+          return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+        } else {
+          return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+        }
+      }
+
       try {
         infoLog(`开始查询战斗记录: ${id}`)
 
@@ -1906,6 +1955,15 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       
       if (inCooldown(cooldownKey)) {
         return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
+      }
+
+      // 自动登录检查
+      if (!await ensureValidCookie()) {
+        if (config.capcomEmail && config.capcomPassword) {
+          return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+        } else {
+          return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+        }
       }
 
       try {
