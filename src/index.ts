@@ -1288,6 +1288,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       'LP'
     ]
     const PLAY_INNER_SELECTORS = ['[class*="play_inner__"]', '[class*="play_inner"]']
+    const NAV_KEY_PATTERNS = NAV_KEYWORDS.map(k => k.replace(/\s+/g, '').toLowerCase())
 
     try {
       debugLog(`开始LP截图流程: ${id}`)
@@ -1329,7 +1330,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       await acceptCookiesIfPresent(page)
       await new Promise(r => setTimeout(r, 1000))
 
-      // 2) 精确点击“排名賽積分（按角色）/排位积分（按角色）/League Points”导航 li（不再点击 a[href$="/play"]）
+      // 2) 精确点击“排名賽積分（按角色）/排位积分（按角色）/League Points”导航 li
       let clickedNav = false
       const navLiSelector = await page.evaluate((KEYS: string[]) => {
         // 在潜在的导航容器中查找 li
@@ -1399,19 +1400,24 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
 
       // 3b) 在 /play 页面点击 LP 导航 li（仅按文本匹配，不依赖 class），优先命中“段位积分（各角色）”等关键词
       try {
-        const playNavLiSelector = await page.evaluate((patterns: string[]) => {
-          const norm = (s: string) => (s || '').replace(/\s+/g, '').toLowerCase()
-          const lis = Array.from(document.querySelectorAll('li'))
-          const found = lis.find(li => {
-            const text = norm((li as HTMLElement).innerText || '')
-            return patterns.some(p => text.includes(norm(p)))
-          })
-          if (found) {
-            (found as HTMLElement).setAttribute('data-koishi-nav-lp-play', '1')
-            return '[data-koishi-nav-lp-play="1"]'
+        const playNavLiSelector = await page.evaluate((PATTERNS: string[]) => {
+          var lis = Array.from(document.querySelectorAll('li'));
+          var found = null;
+          for (var i = 0; i < lis.length; i++) {
+            var li = lis[i];
+            var text = ((li as HTMLElement).innerText || '').replace(/\s+/g, '').toLowerCase();
+            var matched = false;
+            for (var k = 0; k < PATTERNS.length; k++) {
+              if (text.indexOf(PATTERNS[k]) !== -1) { matched = true; break; }
+            }
+            if (matched) { found = li; break; }
           }
-          return null
-        }, NAV_KEYWORDS)
+          if (found) {
+            (found as HTMLElement).setAttribute('data-koishi-nav-lp-play', '1');
+            return '[data-koishi-nav-lp-play="1"]';
+          }
+          return null;
+        }, NAV_KEY_PATTERNS)
 
         if (playNavLiSelector) {
           await page.waitForSelector(playNavLiSelector, { timeout: 5000 })
