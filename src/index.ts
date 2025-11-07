@@ -13,7 +13,7 @@ declare module 'koishi' {
         setUserAgent(userAgent: string): Promise<void>
         setExtraHTTPHeaders(headers: Record<string, string>): Promise<void>
         goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<void>
-        waitForSelector(selector: string, options?: { timeout?: number }): Promise<void>
+        waitForSelector(selector: string, options?: { timeout?: number; visible?: boolean }): Promise<void>
         $(selector: string): Promise<{
           screenshot(options: { type: 'png' }): Promise<Buffer>
           click(options?: any): Promise<void>
@@ -182,6 +182,7 @@ export function apply(ctx: Context, config: Config) {
   const screenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const winRateCache = new SimpleCache<WinRateData>(CACHE_TTL)
   const winRateScreenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
+  const leaguePointScreenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const battlelogScreenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
   const playerSearchCache = new SimpleCache<PlayerSearchResult[]>(CACHE_TTL)
   const playerSearchScreenshotCache = new SimpleCache<Buffer>(CACHE_TTL)
@@ -556,7 +557,7 @@ export function apply(ctx: Context, config: Config) {
     const text = html.toLowerCase()
     // 更精确的登录页检测 - 只有同时包含登录相关词汇和登录表单/按钮时才认为是登录页
     const hasLoginKeywords = /login|signin|登录|請登入|サインイン|sign in/.test(text)
-    const hasLoginForm = /type=[\"\']password[\"\']|login.?form|signin.?form|oauth|auth.?button/.test(text)
+    const hasLoginForm = /type=["']password["']|login.?form|signin.?form|oauth|auth.?button/.test(text)
     const hasProfileContent = /character_character_status|段位积分|league.?point|rank|profile/.test(text)
     
     // 如果有排位内容，就不是登录页
@@ -1257,6 +1258,248 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
       debugLog('浏览器页面已关闭')
     }
   }
+  // 截取段位LP区域截图（从profile页点击进入，再截取 play_inner 区域）
+  async function takeLeaguePointScreenshot(id: string): Promise<Buffer> {
+    const cacheKey = `rank_lp_screenshot:${id}`
+    const cached = leaguePointScreenshotCache.get(cacheKey)
+    if (cached) {
+      debugLog(`使用缓存LP截图: ${id}`)
+      return cached
+    }
+
+    if (!ctx.puppeteer) {
+      throw new Error('需要安装 puppeteer 服务才能使用截图功能。请安装 koishi-plugin-puppeteer。')
+    }
+
+    const page = await ctx.puppeteer.page()
+
+    // 导航关键字与目标容器选择器
+    const NAV_KEYWORDS = [
+      '段位积分（各角色）',
+      '段位积分',
+      '排名赛积分（按角色）',
+      '排名赛积分',
+      '排名賽積分（按角色）',
+      '排名賽積分',
+      '排位积分（按角色）',
+      '排位积分',
+      'League Points',
+      'League Point',
+      'LP'
+    ]
+    const PLAY_INNER_SELECTORS = ['[class*="play_inner__"]', '[class*="play_inner"]']
+
+    try {
+      debugLog(`开始LP截图流程: ${id}`)
+
+      // 设置浏览器环境
+      await page.setUserAgent(config.userAgent)
+      await page.setExtraHTTPHeaders({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Referer': profileUrl(id),
+      })
+      await page.setViewport({ width: 1920, height: 1080 })
+
+      // 设置Cookie
+      if (runtimeCookie) {
+        debugLog('开始设置Cookie')
+        const cookies = runtimeCookie.split(';').map(cookie => {
+          const [name, ...valueParts] = cookie.trim().split('=')
+          const value = valueParts.join('=')
+          return {
+            name: name.trim(),
+            value: value?.trim() || '',
+            domain: '.streetfighter.com'
+          }
+        }).filter(cookie => cookie.name && cookie.value)
+
+        if (cookies.length > 0) {
+          await page.setCookie(...cookies)
+          debugLog(`成功设置 ${cookies.length} 个Cookie`)
+        }
+      }
+
+      // 1) 进入 profile 页面
+      const profile = profileUrl(id)
+      debugLog(`导航到个人资料页: ${profile}`)
+      await page.goto(profile, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      await acceptCookiesIfPresent(page)
+      await new Promise(r => setTimeout(r, 1000))
+
+      // 2) 精确点击“排名賽積分（按角色）/排位积分（按角色）/League Points”导航 li（不再点击 a[href$="/play"]）
+      let clickedNav = false
+      const navLiSelector = await page.evaluate((KEYS: string[]) => {
+        // 在潜在的导航容器中查找 li
+        const containers = Array.from(document.querySelectorAll('nav, ul, div'))
+        const lis = containers.flatMap(c => Array.from(c.querySelectorAll('li')))
+        const found = lis.find(li => {
+          const text = (li as HTMLElement).innerText?.trim() || ''
+          const cls = li.className || ''
+          const looksNav = /\bplay_nav\b/i.test(cls) || /\bplay_nav_active\b/i.test(cls)
+          const hasKeyword = KEYS.some(k => text.toLowerCase().includes(k.toLowerCase()))
+          return looksNav && hasKeyword
+        })
+        if (found) {
+          (found as HTMLElement).setAttribute('data-koishi-nav-lp', '1')
+          return '[data-koishi-nav-lp="1"]'
+        }
+        // 备用：直接选择 active tab
+        const active = document.querySelector('li[class*="play_nav_active"]')
+        if (active) {
+          (active as HTMLElement).setAttribute('data-koishi-nav-lp', '1')
+          return '[data-koishi-nav-lp="1"]'
+        }
+        return null
+      }, NAV_KEYWORDS)
+
+      if (navLiSelector) {
+        try {
+          await page.waitForSelector(navLiSelector, { timeout: 5000 })
+          const el = await page.$(navLiSelector)
+          if (el) {
+            const liClass = await el.evaluate((n: HTMLElement) => n.className)
+            debugLog(`点击LP导航 li（class: ${liClass}）`)
+            await el.click()
+            clickedNav = true
+            // 等待导航或内容容器出现
+            try {
+              await Promise.race([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }),
+                (async () => {
+                  for (const s of PLAY_INNER_SELECTORS) {
+                    try { await page.waitForSelector(s, { timeout: 2500 }) ; return } catch {}
+                  }
+                })(),
+              ])
+            } catch {
+              debugLog('导航点击后等待结束，继续处理')
+            }
+          }
+        } catch {
+          // 忽略，继续后续兜底逻辑
+        }
+      }
+      // 无论是否点击成功，后续将兜底到 /play 并直接定位 play_inner 容器
+
+      // 3) 兜底：如果当前不在 /play 则直接跳转
+      try {
+        const currentUrl = page.url()
+        if (!/\/play(?:[\/?#]|$)/.test(currentUrl)) {
+          const play = playUrl(id)
+          debugLog(`跳转到play页: ${play}`)
+          await page.goto(play, { waitUntil: 'domcontentloaded', timeout: 30000 })
+          await acceptCookiesIfPresent(page)
+        }
+      } catch (e) {
+        debugLog('跳转到play页失败（忽略并继续）', e)
+      }
+
+      // 3b) 在 /play 页面点击 LP 导航 li（仅按文本匹配，不依赖 class），优先命中“段位积分（各角色）”等关键词
+      try {
+        const playNavLiSelector = await page.evaluate((patterns: string[]) => {
+          const norm = (s: string) => (s || '').replace(/\s+/g, '').toLowerCase()
+          const lis = Array.from(document.querySelectorAll('li'))
+          const found = lis.find(li => {
+            const text = norm((li as HTMLElement).innerText || '')
+            return patterns.some(p => text.includes(norm(p)))
+          })
+          if (found) {
+            (found as HTMLElement).setAttribute('data-koishi-nav-lp-play', '1')
+            return '[data-koishi-nav-lp-play="1"]'
+          }
+          return null
+        }, NAV_KEYWORDS)
+
+        if (playNavLiSelector) {
+          await page.waitForSelector(playNavLiSelector, { timeout: 5000 })
+          const playNavLi = await page.$(playNavLiSelector)
+          if (playNavLi) {
+            const clickedText = await playNavLi.evaluate((el: HTMLElement) => el.innerText?.trim() || '')
+            debugLog(`在 /play 页面点击 LP 导航 li（text: ${clickedText}）`)
+            await playNavLi.click()
+            // 点击后短暂等待容器出现（不强依赖导航完成）
+            try {
+              await Promise.race([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 6000 }),
+                (async () => {
+                  for (const s of PLAY_INNER_SELECTORS) {
+                    try { await page.waitForSelector(s, { timeout: 2000 }); return } catch {}
+                  }
+                })(),
+              ])
+            } catch {}
+          }
+        } else {
+          debugLog('在 /play 页面未找到 LP 导航 li（纯文本关键词未命中），继续定位 play_inner 容器')
+        }
+      } catch (e) {
+        debugLog('在 /play 页面点击 LP 导航 li 失败（忽略并继续）', e)
+      }
+      // 4) 寻找并截图 play_inner 容器
+      let targetEl: any = null
+      let usedSelector = ''
+      // 先按选择器精确匹配
+      for (const sel of PLAY_INNER_SELECTORS) {
+        try {
+          await page.waitForSelector(sel, { timeout: 5000 })
+          targetEl = await page.$(sel)
+          if (targetEl) {
+            usedSelector = sel
+            debugLog(`找到 play_inner 容器: ${sel}`)
+            break
+          }
+        } catch {}
+      }
+
+      // 如果仍未找到，使用智能定位：标记包含数值与关键词的 play_* 容器
+      if (!targetEl) {
+        debugLog('未命中 play_inner 选择器，尝试智能定位 play 区域...')
+        const marker = await page.evaluate(() => {
+          const nodes = Array.from(document.querySelectorAll('div,section,article'))
+          const likely = nodes.find(el => {
+            const cls = (el.className || '').toString()
+            const isPlay = /\bplay_/i.test(cls)
+            const text = (el as HTMLElement).innerText || ''
+            const hasNumber = /(?:\d{1,3}(?:,\d{3})+|\d{3,})/.test(text)
+            const hasLPKeyword = /LP|League\s*Point|段位积分|排名賽積分/i.test(text)
+            // 宽松条件：play_* 且有数值 或 有 LP 关键词
+            return isPlay && (hasNumber || hasLPKeyword)
+          })
+          if (likely) {
+            (likely as HTMLElement).setAttribute('data-koishi-play-inner', '1')
+            return '[data-koishi-play-inner="1"]'
+          }
+          return null
+        })
+        if (marker) {
+          try {
+            await page.waitForSelector(marker, { timeout: 4000 })
+            targetEl = await page.$(marker)
+            usedSelector = marker
+            if (targetEl) {
+              debugLog(`智能定位 play 区域成功，使用标记选择器: ${marker}`)
+            }
+          } catch {}
+        }
+      }
+
+      if (!targetEl) {
+        debugLog('play_inner 容器仍未找到，开始诊断失败原因...')
+        throw await diagnoseScreenshotFailure(page)
+      }
+
+      const screenshot = await targetEl.screenshot({ type: 'png' })
+      leaguePointScreenshotCache.set(cacheKey, screenshot)
+      infoLog(`成功完成LP截图并缓存: ${id}${usedSelector ? `（selector: ${usedSelector}）` : ''}`)
+      return screenshot
+    } finally {
+      await page.close()
+      debugLog('浏览器页面已关闭')
+    }
+  }
 
   async function takeBattlelogScreenshot(id: string): Promise<Buffer> {
     const cacheKey = `battlelog_screenshot:${id}`
@@ -1477,7 +1720,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
         
         const success = await setUserPlayerId(session!.userId, id)
         if (success) {
-          return `已绑定玩家ID：${id}\n之后可直接使用：排位查询 / 胜率查询 / 战斗记录`
+          return `已绑定玩家ID：${id}\n之后可直接使用：玩家查询 / 胜率查询 / 战斗记录`
         } else {
           return '绑定失败，请稍后重试。'
         }
@@ -1506,9 +1749,9 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
     })
 
   // 主命令：排位查询 [玩家ID或@用户]
-  ctx.command('排位查询 [param:text]', '查询 SF6 排位积分信息')
-    .example('排位查询 1234567890')
-    .example('排位查询 @用户')
+  ctx.command('玩家查询 [param:text]', '查询 SF6 排位积分信息')
+    .example('玩家查询 1234567890')
+    .example('玩家查询 @用户')
     .action(async ({ session }, param) => {
       try {
         infoLog(`开始排位查询，用户: ${session?.userId}, 参数: ${param}`)
@@ -1523,7 +1766,7 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
             if (session.elements?.some((el: any) => el.type === 'at')) {
               return '该用户还未绑定街霸6玩家ID。请提醒其使用：绑定ID <玩家ID>'
             } else {
-              return '参数格式错误。请使用：排位查询 <玩家ID> 或 排位查询 @用户'
+              return '参数格式错误。请使用：玩家查询 <玩家ID> 或 玩家查询 @用户'
             }
           } else {
             // 没有参数且当前用户也没绑定
@@ -1670,6 +1913,89 @@ function parsePlayerSearchResults(html: string): PlayerSearchResult[] {
             return '截图功能不可用：需要安装 puppeteer 插件。'
           }
           return `查询失败：${e?.message || '未知错误'}`
+        }
+      } catch (e: any) {
+        warnLog('玩家查询整体失败:', e)
+        return `玩家查询失败：${e?.message || '未知错误'}`
+      }
+    })
+
+  // 新增：排位查询命令（仅截图LP区域）
+  ctx.command('排位查询 [param:text]', '查询 SF6 排位LP信息（仅截图）')
+    .example('排位查询 1234567890')
+    .example('排位查询 @用户')
+    .action(async ({ session }, param) => {
+      const { playerId: id, targetInfo } = await parseQueryParam(session, param)
+
+      if (!id) {
+        if (param && param.trim()) {
+          if (session.elements?.some((el: any) => el.type === 'at')) {
+            return '该用户还未绑定街霸6玩家ID。请提醒其使用：绑定ID <玩家ID>'
+          } else {
+            return '参数格式错误。请使用：排位查询 <玩家ID> 或 排位查询 @用户'
+          }
+        } else {
+          return '未绑定玩家ID。请先使用：绑定ID <玩家ID>'
+        }
+      }
+      if (!/^\d{5,}$/.test(id)) return '玩家ID格式错误，应该是5位以上的数字。'
+
+      const userId = session?.userId || 'unknown'
+      const cooldownKey = `ranklp:${userId}:${id}`
+      if (inCooldown(cooldownKey)) {
+        return `查询太频繁，请稍后再试。（冷却时间：${COOLDOWN_SEC}秒）`
+      }
+
+      if (!config.enableScreenshotOutput) {
+        return '错误：截图输出已禁用，请在配置中启用。'
+      }
+
+      // 自动登录检查
+      if (!await ensureValidCookie()) {
+        if (config.capcomEmail && config.capcomPassword) {
+          return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+        } else {
+          return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+        }
+      }
+
+      try {
+        // 显示等待消息
+        let waitingMessageId: string | undefined
+        if (SHOW_WAITING_MESSAGE) {
+          try {
+            const waiting = await session?.send(`🔍 正在查询排位积分，请稍候...${targetInfo}`)
+            if (waiting && Array.isArray(waiting) && waiting[0]) {
+              waitingMessageId = waiting[0]
+            }
+          } catch {}
+
+        }
+
+        try {
+          const screenshot = await takeLeaguePointScreenshot(id)
+          // 撤回等待
+          if (waitingMessageId && session?.bot?.deleteMessage) {
+            try { await session.bot.deleteMessage(session.channelId, waitingMessageId) } catch {}
+          }
+          await session?.send('排位信息：')
+          await session?.send(h.image(screenshot, 'image/png'))
+          return null
+        } catch (e: any) {
+          if (waitingMessageId && session?.bot?.deleteMessage) {
+            try { await session.bot.deleteMessage(session.channelId, waitingMessageId) } catch {}
+          }
+          warnLog('排位LP截图失败:', e)
+          if (String(e?.message).includes('登录')) {
+            return '查询失败：需要登录权限。请检查Cookie设置。'
+          }
+          if (String(e?.message).includes('Cookie')) {
+            return '排位查询失败：需要有效登录 Cookie。请检查配置中的Cookie设置。'
+          }
+          if (String(e?.message).includes('puppeteer')) {
+            return '截图功能不可用：需要安装 puppeteer 插件。'
+          }
+          return `排位查询失败：${e?.message || '未知错误'}`
         }
       } catch (e: any) {
         warnLog('排位查询整体失败:', e)
