@@ -48,6 +48,12 @@ export async function fetchHtml(state: PluginState, url: string): Promise<string
         signal: AbortSignal.timeout(HTTP_TIMEOUT),
     })
 
+    if (res.status === 401 || res.status === 403) {
+        state.warnLog(`Buckler 拒绝访问: ${res.status}，当前 Cookie 无效或已过期`)
+        state.invalidateRuntimeCookie()
+        throw new Error('需要有效登录 Cookie：当前 Cookie 无效、已过期或没有 Buckler 访问权限。')
+    }
+
     if (!res.ok) {
         state.warnLog(`HTTP 请求失败: ${res.status} ${res.statusText}`)
         throw new Error(`请求失败: ${res.status}`)
@@ -55,6 +61,14 @@ export async function fetchHtml(state: PluginState, url: string): Promise<string
 
     const html = await res.text()
     state.debugLog(`获取到HTML，长度: ${html.length}`)
+
+    if (looksLikeLoginPage(html)) {
+        state.warnLog('Buckler 返回登录墙，当前 Cookie 无效或已过期')
+        state.invalidateRuntimeCookie()
+        throw new Error('需要有效登录 Cookie：当前 Cookie 无效、已过期或没有 Buckler 访问权限。')
+    }
+
+    state.lastCookieValidation = Date.now()
     return html
 }
 
@@ -62,9 +76,10 @@ export async function fetchHtml(state: PluginState, url: string): Promise<string
  * 检测是否被重定向到登录页
  */
 export function looksLikeLoginPage(html: string): boolean {
-    // 如果页面很大（超过50KB），基本上不是纯登录页面
-    if (html.length > 50000) {
-        return false
+    // Buckler 的未登录页面仍可能超过 50KB，不能用页面大小判断登录状态。
+    if (/"statusCode"\s*:\s*(?:401|403)/.test(html) ||
+        /common[^<]{0,200}"statusCode"\s*:\s*(?:401|403)/.test(html)) {
+        return true
     }
 
     // 检测真正的登录页面特征（表单相关的，不是导航栏按钮）
@@ -97,10 +112,21 @@ export function looksLikeLoginPage(html: string): boolean {
         html.includes('list_fighter') ||  // 搜索结果特有
         html.includes('list_inner')        // 搜索结果特有
 
-    // 如果页面很短且没有玩家内容，可能是重定向
-    if (html.length < 5000 && !hasPlayerContent) {
+    // 页面没有玩家内容且包含未注册页面结构时，也视为登录墙。
+    const hasRegistrationWall = html.includes('not_registered_register') &&
+        (html.includes('not_registered_lead') || html.includes('not_registered_ex1'))
+
+    if (!hasPlayerContent && (hasRegistrationWall || html.length < 5000)) {
         return true
     }
 
     return false
+}
+
+/**
+ * 检查页面是否包含已登录用户的非零资料链接。
+ */
+export function hasAuthenticatedProfileLink(html: string): boolean {
+    return Array.from(html.matchAll(/(?:\/|\\u002F)profile(?:\/|\\u002F)(\d+)/g))
+        .some(match => Number(match[1]) > 0)
 }

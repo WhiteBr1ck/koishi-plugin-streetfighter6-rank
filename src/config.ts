@@ -1,6 +1,7 @@
 import { Schema } from 'koishi'
 
 export interface Config {
+    cookie?: string
     capcomEmail?: string
     capcomPassword?: string
     cookieRefreshInterval: number
@@ -14,9 +15,10 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.intersect([
     Schema.object({
-        capcomEmail: Schema.string().description('CAPCOM ID 邮箱（用于自动登录）'),
-        capcomPassword: Schema.string().role('secret').description('CAPCOM ID 密码'),
-        cookieRefreshInterval: Schema.number().default(12).description('Cookie 自动刷新间隔（小时），0为不自动刷新').min(0),
+        cookie: Schema.string().role('secret').description('Buckler 登录cookies（最高优先级）'),
+        capcomEmail: Schema.string().description('CAPCOM ID 邮箱（大概率被 Cloudflare 拦截，不推荐使用）'),
+        capcomPassword: Schema.string().role('secret').description('CAPCOM ID 密码（大概率被 Cloudflare 拦截，不推荐使用）'),
+        cookieRefreshInterval: Schema.number().default(12).description('账号密码自动登录 Cookie 刷新间隔（小时），0为不自动刷新（大概率被 Cloudflare 拦截，不推荐使用）').min(0),
         userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36').description('浏览器 User-Agent'),
     }).description('账号设置'),
 

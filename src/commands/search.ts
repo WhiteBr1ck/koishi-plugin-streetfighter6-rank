@@ -29,9 +29,9 @@ export function registerSearchCommands(ctx: Context, state: PluginState) {
             // 自动登录检查
             if (!await ensureValidCookie(state)) {
                 if (state.config.capcomEmail && state.config.capcomPassword) {
-                    return '自动登录失败，请检查配置或稍后重试。您也可以尝试手动运行 `SF6登录`。';
+                    return '没有可用的登录 Cookie。账号密码自动登录可能被 Cloudflare 拦截，请在插件配置中填写从已登录 Buckler 页面复制的 Cookie。';
                 } else {
-                    return '需要有效登录 Cookie。请先在配置中设置 Cookie 或 CAPCOM 账号信息。';
+                    return '需要有效登录 Cookie。请在插件配置中填写从已登录 Buckler 页面复制的 Cookie。';
                 }
             }
 

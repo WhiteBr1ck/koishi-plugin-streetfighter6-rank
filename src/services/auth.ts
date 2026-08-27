@@ -1,5 +1,5 @@
 import { PluginState, LOGIN_RETRY_INTERVAL } from '../state'
-import { looksLikeLoginPage } from './http'
+import { hasAuthenticatedProfileLink, looksLikeLoginPage } from './http'
 import { acceptCookiesIfPresent } from './puppeteer'
 
 /**
@@ -49,8 +49,8 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
         await new Promise(resolve => setTimeout(resolve, 2000))
         const mainPageHtml = await page.evaluate(() => document.documentElement.outerHTML)
 
-        // 通过检查页面是否包含特定的个人资料链接来判断是否已登录
-        const isLoggedIn = !looksLikeLoginPage(mainPageHtml) && /profile\/\d+/.test(mainPageHtml)
+        // 匿名首页同样包含 profile/0，必须找到非零资料 ID 才能判定为已登录。
+        const isLoggedIn = !looksLikeLoginPage(mainPageHtml) && hasAuthenticatedProfileLink(mainPageHtml)
 
         if (isLoggedIn) {
             state.debugLog('检测到已登录状态，直接获取Cookie')
@@ -72,7 +72,7 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
         // 第一步：直接访问登录页面
         const loginUrl = `${state.config.baseUrl}/${state.config.locale}/auth/loginep?redirect_url=/`
         state.debugLog(`直接访问登录页面: ${loginUrl}`)
-        await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 })
+        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
         await acceptCookiesIfPresent(state, page)
 
         // 等待页面加载完成，然后检查当前页面内容
@@ -82,6 +82,18 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
 
         const pageContent = await page.evaluate(() => document.body.innerText.toLowerCase())
         state.debugLog(`页面内容关键词: ${pageContent.substring(0, 200)}`)
+
+        const securityChallengePatterns = [
+            '正在进行安全验证',
+            'security verification',
+            'checking your browser',
+            'verify you are human',
+            'cloudflare',
+        ]
+        if (currentUrl.includes('auth.cid.capcom.com') &&
+            securityChallengePatterns.some(pattern => pageContent.includes(pattern))) {
+            throw new Error('CAPCOM 登录被 Cloudflare 安全验证拦截，请改用手动 Cookie')
+        }
 
         // 第二步：处理Cookie接受界面
         if (pageContent.includes('cookies') || pageContent.includes('cookie')) {
@@ -152,7 +164,7 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
 
         // 验证邮箱输入是否正确
         const emailValue = await emailInput.evaluate((el: any) => el.value)
-        state.debugLog(`邮箱输入验证: 期望=${state.config.capcomEmail}, 实际=${emailValue}`)
+        state.debugLog(`邮箱输入验证: ${emailValue === state.config.capcomEmail ? '成功' : '失败'}`)
         if (emailValue !== state.config.capcomEmail) {
             state.debugLog('邮箱输入不完整，重新输入...')
             await emailInput.evaluate((el: any) => el.value = '')
@@ -162,7 +174,7 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
 
             // 再次验证
             const emailValue2 = await emailInput.evaluate((el: any) => el.value)
-            state.debugLog(`邮箱二次输入验证: 期望=${state.config.capcomEmail}, 实际=${emailValue2}`)
+            state.debugLog(`邮箱二次输入验证: ${emailValue2 === state.config.capcomEmail ? '成功' : '失败'}`)
         }
 
         // 填写密码，同样增加等待时间
@@ -259,6 +271,12 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
             state.debugLog('访问Buckler页面失败，但继续尝试获取Cookie...')
         }
 
+        // 只有确认受保护资料链接已经可用，才接受本次登录产生的 Cookie。
+        const verifiedHtml = await page.evaluate(() => document.documentElement.outerHTML)
+        if (looksLikeLoginPage(verifiedHtml) || !hasAuthenticatedProfileLink(verifiedHtml)) {
+            throw new Error('CAPCOM 登录未建立有效 Buckler 会话，可能被 Cloudflare 安全验证拦截')
+        }
+
         // 获取所有Cookie
         const cookies = await page.cookies()
         const cookieString = cookies
@@ -286,31 +304,45 @@ export async function performAutoLogin(state: PluginState, force: boolean = fals
  * 检查并更新 Cookie
  */
 export async function ensureValidCookie(state: PluginState): Promise<boolean> {
-    // 优先使用自动登录获取的Cookie
-    if (state.config.capcomEmail && state.config.capcomPassword && !state.runtimeCookie) {
-        state.debugLog('检测到配置了自动登录但无Cookie，尝试自动登录')
-        const newCookie = await performAutoLogin(state)
-        if (newCookie) {
-            state.runtimeCookie = newCookie
-            state.infoLog('已通过自动登录更新Cookie')
-            return true
-        }
-    }
+    const now = Date.now()
 
-    // 如果有配置的Cookie但自动登录账号密码也配置了，定期刷新
-    if (state.config.capcomEmail && state.config.capcomPassword && state.runtimeCookie && state.config.cookieRefreshInterval > 0) {
-        const now = Date.now()
+    // 自动登录取得的 Cookie 到达刷新间隔后尝试刷新。刷新失败时保留仍有效的旧 Cookie。
+    if (state.runtimeCookie &&
+        state.runtimeCookieSource === 'auto' &&
+        state.config.capcomEmail &&
+        state.config.capcomPassword &&
+        state.config.cookieRefreshInterval > 0) {
         const refreshIntervalMs = state.config.cookieRefreshInterval * 3600000
-        if (state.lastLoginAttempt && (now - state.lastLoginAttempt) > refreshIntervalMs) { // 达到刷新间隔后重新登录
+        if (state.lastLoginSuccess && (now - state.lastLoginSuccess) > refreshIntervalMs) {
             state.debugLog(`Cookie刷新间隔已到（${state.config.cookieRefreshInterval}小时），尝试重新登录刷新`)
             const newCookie = await performAutoLogin(state)
             if (newCookie) {
-                state.runtimeCookie = newCookie
-                state.infoLog('已刷新Cookie')
-                return true
+                state.setRuntimeCookie(newCookie, 'auto')
+                state.lastLoginSuccess = Date.now()
+                state.lastCookieValidation = Date.now()
+                state.infoLog('已刷新并验证 Cookie')
             }
         }
     }
 
-    return !!state.runtimeCookie
+    if (state.runtimeCookie) return true
+
+    // 配置了最高优先级的手动 Cookie 时，不自动降级到账号密码登录。
+    // 无效 Cookie 会由实际查询返回的 403 或登录墙负责清除和提示。
+    if (state.config.cookie?.trim()) return false
+
+    // 没有可用 Cookie 时才尝试实验性的账号密码自动登录。
+    if (state.config.capcomEmail && state.config.capcomPassword) {
+        state.debugLog('当前没有有效 Cookie，尝试账号密码自动登录')
+        const newCookie = await performAutoLogin(state)
+        if (newCookie) {
+            state.setRuntimeCookie(newCookie, 'auto')
+            state.lastLoginSuccess = Date.now()
+            state.lastCookieValidation = Date.now()
+            state.infoLog('已通过自动登录获取并验证 Cookie')
+            return true
+        }
+    }
+
+    return false
 }

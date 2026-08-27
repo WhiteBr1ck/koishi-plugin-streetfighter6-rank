@@ -66,12 +66,27 @@ export async function diagnoseScreenshotFailure(state: PluginState, page: any): 
         state.debugLog(`当前页面URL: ${currentUrl}`)
 
         // 检查页面内容
-        const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || '')
+        const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || '')
+        const pageHtml = await page.evaluate(() => document.documentElement?.outerHTML?.slice(0, 200000) || '')
         state.debugLog(`页面内容预览: ${bodyText}`)
 
         // 检查是否是登录页面
-        if (currentUrl.includes('login') || currentUrl.includes('capcom-id')) {
-            return new Error('需要登录：页面被重定向到登录页面，请检查Cookie设置')
+        const loginWallPatterns = [
+            '要使用本服务，您必须登录或注册',
+            '要使用本服務，您必須登入或註冊',
+            '本サービスを利用するにはログイン',
+            'You must log in or register',
+            '로그인 또는 회원가입',
+        ]
+        const isLoginWall = currentUrl.includes('login') ||
+            currentUrl.includes('capcom-id') ||
+            currentUrl.includes('/profile/auth') ||
+            /"statusCode"\s*:\s*(?:401|403)/.test(pageHtml) ||
+            loginWallPatterns.some(pattern => bodyText.includes(pattern))
+
+        if (isLoginWall) {
+            state.invalidateRuntimeCookie()
+            return new Error('需要有效登录 Cookie：当前 Cookie 无效、已过期或页面停留在登录验证界面。')
         }
 
         // 检查是否是错误页面
@@ -109,6 +124,10 @@ export async function setupPageWithCookies(state: PluginState, page: any): Promi
             }
         }).filter(cookie => cookie.name && cookie.value)
 
+        if (cookies.length > 0) {
+            await page.setCookie(...cookies)
+            state.debugLog(`成功设置 ${cookies.length} 个Cookie`)
+        }
     }
 }
 

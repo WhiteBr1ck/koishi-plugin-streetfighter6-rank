@@ -69,6 +69,7 @@ export async function takeBattlelogScreenshot(state: PluginState, id: string): P
         const element = await page.$('[class*="battlelog_inner"]')
         if (element) {
             state.debugLog('找到battlelog_inner元素，截取指定区域')
+            state.lastCookieValidation = Date.now()
             const screenshot = await element.screenshot({ type: 'png' })
             state.battlelogScreenshotCache.set(cacheKey, screenshot)
             state.infoLog(`成功完成战斗记录截图并缓存: ${id}`)

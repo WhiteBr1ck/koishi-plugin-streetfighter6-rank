@@ -11,6 +11,8 @@ export const COOLDOWN_SEC = 5 // 冷却时间 5 秒
 export const SHOW_WAITING_MESSAGE = true // 显示等待消息
 export const LOGIN_RETRY_INTERVAL = 300000 // 5分钟重试间隔
 
+export type CookieSource = 'none' | 'config' | 'environment' | 'auto'
+
 /**
  * 插件共享状态类
  * 管理所有运行时状态、缓存和配置
@@ -22,8 +24,11 @@ export class PluginState implements LogFunctions {
 
     // 运行时状态
     runtimeCookie: string = ''
+    runtimeCookieSource: CookieSource = 'none'
     loginInProgress: boolean = false
     lastLoginAttempt: number = 0
+    lastLoginSuccess: number = 0
+    lastCookieValidation: number = 0
 
     // 缓存实例
     rankCache: SimpleCache<RankData>
@@ -48,7 +53,14 @@ export class PluginState implements LogFunctions {
         this.config = config
 
         // 初始化 Cookie
-        this.runtimeCookie = (process.env.SF6_COOKIE || '').trim()
+        const configuredCookie = (config.cookie || '').trim()
+        const environmentCookie = (process.env.SF6_COOKIE || '').trim()
+        this.runtimeCookie = configuredCookie || environmentCookie
+        this.runtimeCookieSource = configuredCookie
+            ? 'config'
+            : environmentCookie
+                ? 'environment'
+                : 'none'
 
         // 初始化缓存
         this.rankCache = new SimpleCache<RankData>(CACHE_TTL)
@@ -81,5 +93,18 @@ export class PluginState implements LogFunctions {
         this.playerSearchCache.clear()
         this.playerSearchScreenshotCache.clear()
         this.cooldownMap.clear()
+    }
+
+    setRuntimeCookie(cookie: string, source: CookieSource) {
+        this.runtimeCookie = cookie.trim()
+        this.runtimeCookieSource = this.runtimeCookie ? source : 'none'
+        this.lastCookieValidation = 0
+    }
+
+    invalidateRuntimeCookie() {
+        this.runtimeCookie = ''
+        this.runtimeCookieSource = 'none'
+        this.lastCookieValidation = 0
+        this.clearAllCaches()
     }
 }

@@ -42,9 +42,11 @@ export async function getPlayerSearchData(state: PluginState, playerName: string
         state.debugLog(`获取到HTML，长度: ${html.length}`)
 
         if (looksLikeLoginPage(html)) {
+            state.invalidateRuntimeCookie()
             throw new Error('需要登录 Cookie 才能搜索玩家')
         }
 
+        state.lastCookieValidation = Date.now()
         const results = parsePlayerSearchResults(state, html)
         state.playerSearchCache.set(cacheKey, results)
         state.debugLog(`搜索完成，找到 ${results.length} 个结果，已缓存`)
@@ -117,8 +119,7 @@ export async function takePlayerSearchScreenshot(state: PluginState, playerName:
             '.list_inner__hpkhV',
             '[class*="list_inner"]',
             '.fighterslist',
-            'main',
-            'body'
+            'main'
         ]
 
         for (const selector of selectors) {
@@ -141,6 +142,7 @@ export async function takePlayerSearchScreenshot(state: PluginState, playerName:
         }
 
         // 截取找到的元素
+        state.lastCookieValidation = Date.now()
         const screenshot = await element.screenshot({ type: 'png' })
         state.playerSearchScreenshotCache.set(cacheKey, screenshot)
         state.debugLog(`搜索结果截图已缓存: ${playerName}`)

@@ -136,8 +136,7 @@ export async function takeScreenshot(state: PluginState, id: string): Promise<Bu
             '.character_character_status__5EtcB',  // 只是角色状态
             'article[class*="character_status"]',   // 模糊匹配
             'article[class*="character"]',          // 更宽泛的匹配
-            'main',                                 // 兜底选择器
-            'body'                                  // 最后的兜底
+            'main'                                  // 兜底选择器
         ]
 
         let element = null
@@ -161,6 +160,7 @@ export async function takeScreenshot(state: PluginState, id: string): Promise<Bu
 
         if (element) {
             state.debugLog(`开始截取元素 (${usedSelector})`)
+            state.lastCookieValidation = Date.now()
             const screenshot = await element.screenshot({ type: 'png' })
             state.screenshotCache.set(cacheKey, screenshot)
             state.infoLog(`成功完成截图并缓存: ${id}`)
@@ -416,6 +416,7 @@ export async function takeLeaguePointScreenshot(state: PluginState, id: string):
         // 等待图片加载（新增）
         await waitForImages(state, page)
 
+        state.lastCookieValidation = Date.now()
         const screenshot = await targetEl.screenshot({ type: 'png' })
         state.leaguePointScreenshotCache.set(cacheKey, screenshot)
         state.infoLog(`成功完成LP截图并缓存: ${id}${usedSelector ? `（selector: ${usedSelector}）` : ''}`)

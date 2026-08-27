@@ -122,6 +122,7 @@ export async function takeWinRateScreenshot(state: PluginState, id: string): Pro
         const element = await page.$('[class*="winning_rate_winning_rate"]')
         if (element) {
             state.debugLog('找到winning_rate_winning_rate元素，截取指定区域')
+            state.lastCookieValidation = Date.now()
             const screenshot = await element.screenshot({ type: 'png' })
             state.winRateScreenshotCache.set(cacheKey, screenshot)
             state.infoLog(`成功完成胜率截图并缓存: ${id}`)
